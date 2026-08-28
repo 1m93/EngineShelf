@@ -500,6 +500,18 @@ function curlBytes(text) {
   );
 }
 
+// The Windows CLI has no curl in the picture, so it draws its own meter - see
+// Write-Meter in engineshelf.ps1, which is the other half of this:
+//
+//   "  100 MB / 232 MB · 16s left · 12 MB/s  43%"
+//
+// The bytes and the estimate are already worded the way this file words a curl
+// meter, so they are lifted straight out and a row reads the same whichever
+// platform is behind it. The percentage is last on the line, which is also what
+// makes the bare-percentage fallback below catch it if this ever stops matching.
+const OWN_METER =
+  /^\s*(\d[\d.]* [KMGT]?B \/ \d[\d.]* [KMGT]?B)(?: · ((?:\d+[hms] )+left))?.*?(\d{1,3})%\s*$/;
+
 // "0:00:11" -> "11s left". A dashed clock means curl has nothing to estimate from.
 function curlLeft(text) {
   const found = String(text).match(/^(\d+):(\d\d):(\d\d)$/);
@@ -565,6 +577,12 @@ function readJob(output) {
         ]
           .filter(Boolean)
           .join(' · ') || null;
+      return info;
+    }
+    const own = frames[index].match(OWN_METER);
+    if (own) {
+      info.percent = Math.min(100, Number(own[3]));
+      info.detail = [own[1], own[2]].filter(Boolean).join(' · ') || null;
       return info;
     }
     // A terminal-style bar - an older CLI, or an install run by hand - still

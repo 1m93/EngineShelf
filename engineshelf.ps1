@@ -529,6 +529,140 @@ function Invoke-Migration {
     New-Item -ItemType File -Force -Path (Join-Path $Root '.migrated') | Out-Null
 }
 
+# ---------- downloading ----------
+# On macOS and Linux curl draws the meter and the manager reads the percentage
+# straight out of it. Nothing here draws one: Invoke-WebRequest is ~20x slower
+# with its progress bar on (see $ProgressPreference at the top), and with it off
+# it prints nothing at all - so a 60-300 MB download was minutes of silence, the
+# row stuck on "installing..." with no bar and the job log empty between
+# "Downloading" and "Extracting".
+#
+# So the copying is done here, and this prints its own meter in the shape the
+# page parses - see OWN_METER in gui/app.js, which is the other half of this and
+# the only place that has to agree with it.
+#
+# One line per frame, not one carriage-return redraw: the Windows manager renders
+# a log by re-reading the job's output file, and it holds back a trailing line
+# with no newline behind it because a half-written line cannot be handed to the
+# page. Consecutive frames are collapsed back into one line by the manager, the
+# same way server.py collapses curl's.
+
+# Deliberately not the page's mb(): this is what a human reads in the log, and a
+# 232 MB archive should not be "232.4 MB".
+#
+# Formatted against the invariant culture, not the machine's. `-f` uses the
+# current one, so on a Windows set to Vietnamese, German or French - anywhere the
+# decimal separator is a comma - a gigabyte-sized archive printed "1,3 GB", which
+# the page's meter pattern does not match. The row would have gone back to having
+# no progress at all, on exactly the machines nobody tests on.
+function Format-Bytes {
+    param([long]$Bytes)
+    $invariant = [Globalization.CultureInfo]::InvariantCulture
+    if ($Bytes -ge 1GB) { return [string]::Format($invariant, '{0:0.#} GB', ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return [string]::Format($invariant, '{0:0} MB', ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return [string]::Format($invariant, '{0:0} KB', ($Bytes / 1KB)) }
+    return "$Bytes B"
+}
+
+# The same words gui/app.js puts beside a curl meter, so a Windows log and a
+# macOS log read alike - and so the page can lift this straight out as the
+# detail it shows on the row.
+function Format-Left {
+    param([int]$Seconds)
+    if ($Seconds -le 0) { return '' }
+    if ($Seconds -lt 60) { return "${Seconds}s left" }
+    $minutes = [int][Math]::Floor($Seconds / 60)
+    if ($minutes -lt 60) {
+        $rest = $Seconds % 60
+        if ($rest -gt 0) { return "${minutes}m ${rest}s left" }
+        return "${minutes}m left"
+    }
+    return "$([int][Math]::Floor($minutes / 60))h $($minutes % 60)m left"
+}
+
+# This file is ASCII - PowerShell 5.1 reads a .ps1 with no BOM as ANSI - so the
+# separator the page joins on is written as its code point.
+$MeterDot = [string][char]0x00B7
+
+function Write-Meter {
+    param([long]$Done, [long]$Total, [datetime]$Started, [datetime]$Now)
+    $seconds = ($Now - $Started).TotalSeconds
+    $speed = ''
+    if ($seconds -ge 1) { $speed = "$(Format-Bytes ([long]($Done / $seconds)))/s" }
+
+    if ($Total -le 0) {
+        # A server that will not say how big the file is. No percentage to give,
+        # so the row shows the phase without a bar rather than a made-up number.
+        $parts = @("$(Format-Bytes $Done) fetched", $speed) | Where-Object { $_ }
+        Write-Host ('  ' + ($parts -join " $MeterDot "))
+        return
+    }
+
+    $percent = [int][Math]::Floor(100 * $Done / $Total)
+    if ($percent -gt 100) { $percent = 100 }
+    $left = ''
+    if ($seconds -ge 1 -and $Done -gt 0 -and $Done -lt $Total) {
+        $left = Format-Left ([int](($Total - $Done) / ($Done / $seconds)))
+    }
+    # Bytes first, then the estimate, then the rate, then the percentage last:
+    # the page reads the first two as the detail beside the bar and takes the
+    # percentage off the end of the line.
+    $parts = @("$(Format-Bytes $Done) / $(Format-Bytes $Total)", $left, $speed) |
+             Where-Object { $_ }
+    Write-Host ('  ' + ($parts -join " $MeterDot ") + "  $percent%")
+}
+
+function Save-Download {
+    <#
+      Fetch $Url to $Path, printing a meter as it goes.
+
+      Fetched whole, like the other platforms: an archive that stops halfway is
+      deleted by the caller rather than resumed, because a part-file that lies
+      about being complete is the worse failure.
+    #>
+    param([string]$Url, [string]$Path)
+
+    $request = [Net.HttpWebRequest]::Create($Url)
+    # HttpWebRequest sends no user agent of its own and some CDNs answer 403 to
+    # that; Invoke-WebRequest always sent one.
+    $request.UserAgent = 'EngineShelf'
+    $request.Timeout = 60000            # getting the response at all
+    $request.ReadWriteTimeout = 120000  # a stalled connection mid-file
+    $response = $request.GetResponse()
+
+    $total = [long]$response.ContentLength
+    $source = $response.GetResponseStream()
+    $sink = [IO.File]::Create($Path)
+    $buffer = New-Object byte[] (256 * 1024)
+    $done = 0L
+    $started = Get-Date
+    $said = $started
+    try {
+        while ($true) {
+            $read = $source.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            $sink.Write($buffer, 0, $read)
+            $done += $read
+            # Twice a second. Often enough to watch, rare enough that a long
+            # download does not fill the manager's buffer with meter frames.
+            $now = Get-Date
+            if (($now - $said).TotalMilliseconds -lt 500) { continue }
+            $said = $now
+            Write-Meter $done $total $started $now
+        }
+    } finally {
+        $sink.Dispose()
+        $source.Dispose()
+        $response.Dispose()
+    }
+
+    # The last frame is the only one that says what actually arrived.
+    Write-Meter $done $total $started (Get-Date)
+    if ($total -gt 0 -and $done -lt $total) {
+        throw "Connection closed after $(Format-Bytes $done) of $(Format-Bytes $total)."
+    }
+}
+
 # ---------- install ----------
 function Install-Build {
     param($sel)
@@ -554,7 +688,7 @@ function Install-Build {
     $zip = Join-Path $Root ".download-$key.zip"
 
     try {
-        Invoke-WebRequest -Uri $sel.Url -OutFile $zip
+        Save-Download $sel.Url $zip
     } catch {
         Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
         Remove-Item -Force $zip -ErrorAction SilentlyContinue
@@ -872,6 +1006,137 @@ function Invoke-Probe {
     exit 0
 }
 
+# ---------- what the vendors still serve, and what a milestone is called -------
+# A shelf row says a version was released. Whether it can still be downloaded is
+# a different question and only the vendor can answer it: Playwright deletes its
+# older WebKit archives, and seventy of the ninety-two Chromium milestones on the
+# shelf carry no version string in the shipped catalog.
+#
+# On macOS and Linux the manager asks these questions itself, on background
+# threads. This process is the answer to the same need on Windows, where the
+# manager is a single thread serving HTTP and cannot go and wait on a CDN: it
+# fires this hidden and never waits for it, and reads the answer off disk on a
+# later poll. Which is why the storing lives here rather than there.
+#
+#   engineshelf.ps1 refresh-native webkit versions
+#
+# Not in the help; nobody types it.
+
+$NativeFile = Join-Path $Root 'native.json'
+
+function Read-NativeRecord {
+    if (-not (Test-Path $NativeFile)) { return @{} }
+    try {
+        $found = @{}
+        $data = Get-Content $NativeFile -Raw | ConvertFrom-Json
+        foreach ($prop in $data.PSObject.Properties) { $found[$prop.Name] = $prop.Value }
+        return $found
+    } catch { return @{} }
+}
+
+function Write-NativeRecord {
+    param($Record)
+    $tmp = "$NativeFile.$PID"
+    try {
+        Set-Content -Path $tmp -Value ($Record | ConvertTo-Json -Depth 6 -Compress) -Encoding UTF8
+        Move-Item -Path $tmp -Destination $NativeFile -Force
+    } catch {
+        Remove-Item -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-EpochSeconds { return [int64](([DateTime]::UtcNow - [DateTime]'1970-01-01').TotalSeconds) }
+
+function Test-CanDownload {
+    <# One probe, in this process: the resolver a launch uses, asked quietly. #>
+    param([string]$Sel)
+    try { Resolve-Selector $Sel | Out-Null } catch { return $false }
+    return $true
+}
+
+function Get-WebKitFloor {
+    <#
+      The oldest WebKit build this host can still download, found by halving.
+
+      Playwright deletes from the old end and never from the middle, so one probe
+      rules out or admits half the shelf at a time: six requests instead of the
+      fifty-three that asking about every row would take. Returns $null when even
+      the newest has no archive for this host, which is the answer that means "no
+      native WebKit here at all".
+    #>
+    $ids = @($CatalogShelf | Where-Object { $_.Engine -eq 'webkit' } |
+             ForEach-Object { $_.Id } | Sort-Object)
+    if ($ids.Count -eq 0) { return $null }
+    if (-not (Test-CanDownload "webkit:$($ids[-1])")) { return $null }
+    $low = 0
+    $high = $ids.Count - 1
+    while ($low -lt $high) {
+        $middle = [int][Math]::Floor(($low + $high) / 2)
+        if (Test-CanDownload "webkit:$($ids[$middle])") { $high = $middle }
+        else { $low = $middle + 1 }
+    }
+    return $ids[$low]
+}
+
+function Set-MilestoneNames {
+    <#
+      Ask the dashboard what the uncatalogued Chromium milestones are called.
+
+      One request each, and the answer is a V row in the catalog cache -
+      permanent, because a branch point never moves. A V row with no B row beside
+      it is exactly what this is: it says what Chromium 62 is called, not that a
+      build of it has been found for this machine.
+
+      Sequential, where the shell version fans out six at a time. Nothing waits
+      on this process, and PowerShell 5.1 has no cheap way to parallelise that is
+      worth the two dozen lines of runspace plumbing.
+    #>
+    $rows = @()
+    foreach ($row in $CatalogShelf) {
+        if ($row.Engine -ne 'chromium') { continue }
+        if ($row.Id -notmatch '^\d+$') { continue }
+        $m = [int]$row.Id
+        if ($CatalogVersions.ContainsKey($m)) { continue }
+        $info = Get-MilestoneInfo $m
+        if (-not $info -or -not $info.Branch) { continue }
+        # No note: this row is a name, not a changelog, and the page shows the
+        # note as what a version brought.
+        $rows += "V`t$m`t$m.0.$($info.Branch).0`t"
+    }
+    if ($rows.Count) { Add-CacheRows $rows }
+    return $rows.Count
+}
+
+function Invoke-RefreshNative {
+    param([string[]]$What)
+    $wanted = @($What | Where-Object { $_ })
+    if ($wanted.Count -eq 0) { $wanted = @('webkit', 'versions') }
+    foreach ($item in $wanted) {
+        if (@('webkit', 'versions') -notcontains $item) {
+            Die "Nothing to refresh called '$item' (one of: webkit, versions)"
+        }
+    }
+
+    # Read once, write once, at the end: two of these running at the same time
+    # would otherwise each write back what it read.
+    $record = Read-NativeRecord
+    foreach ($item in $wanted) {
+        if ($item -eq 'webkit') {
+            $floor = Get-WebKitFloor
+            Write-Info "webkit floor: $(if ($null -ne $floor) { $floor } else { 'none downloadable' })"
+            $record['webkit'] = @{ floor = $floor; at = (Get-EpochSeconds) }
+        } else {
+            $named = Set-MilestoneNames
+            Write-Info "named $named milestone$(if ($named -eq 1) { '' } else { 's' })"
+            # Stamped even when nothing could be resolved, so a dashboard that is
+            # down does not turn into a request every four seconds for as long as
+            # the manager is open.
+            $record['versions'] = @{ at = (Get-EpochSeconds) }
+        }
+    }
+    Write-NativeRecord $record
+}
+
 function Invoke-Doctor {
     param([string[]]$Options)
 
@@ -970,6 +1235,7 @@ switch -Regex ($Command) {
     '^(doctor|check)$'     { Invoke-Doctor (@($Selector) + $Rest | Where-Object { $_ }); break }
     '^resolve-for$'        { Invoke-ResolveFor $Selector $Rest[0]; break }
     '^probe$'              { Invoke-Probe $Selector; break }
+    '^refresh-native$'     { Invoke-RefreshNative (@($Selector) + $Rest | Where-Object { $_ }); break }
     '^gui$'                { & (Join-Path $ScriptDir 'gui.ps1') @Rest; break }
     '^(|-h|--help|help)$'  { Show-Usage; break }
     default                { Die "Unknown command: $Command (try --help)" }

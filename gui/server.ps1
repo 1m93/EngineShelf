@@ -98,13 +98,29 @@ function Update-CatalogCache {
     } catch { }
 }
 
+# A browser directory is tens of thousands of files and a profile is worse, and
+# the page asks for the state every second while anything is running. Walking all
+# of it per request is what made the manager feel like it was thinking: cached for
+# the same 15 seconds server.py caches it for, and thrown away the moment a job
+# ends, because that is when a size has actually changed.
+$script:SizeCache = @{}
+$SizeTtlSeconds = 15
+
+function Clear-SizeCache { $script:SizeCache = @{} }
+
 function Get-DirSize {
     param($path)
     if (-not (Test-Path $path)) { return 0 }
+    $hit = $script:SizeCache[$path]
+    if ($hit -and ((Get-Date) - $hit.At).TotalSeconds -lt $SizeTtlSeconds) {
+        return $hit.Value
+    }
     $sum = (Get-ChildItem -Path $path -Recurse -File -Force -ErrorAction SilentlyContinue |
             Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $sum) { return 0 }
-    return [int64]$sum
+    if ($null -eq $sum) { $sum = 0 }
+    $total = [int64]$sum
+    $script:SizeCache[$path] = @{ At = (Get-Date); Value = $total }
+    return $total
 }
 
 # The names engineshelf-docker.ps1 gives the things it creates. The manager
@@ -266,6 +282,57 @@ function Get-NativeRecord {
     try { return (Get-Content $NativeFile -Raw | ConvertFrom-Json) } catch { return $null }
 }
 
+# How long each answer is worth keeping. Same numbers as NATIVE_TTL in
+# gui/server.py. 'edge' is deliberately not here: Get-EnginePlatforms says Edge
+# publishes nothing for Windows, so every Edge row is container-only already and
+# there is no feed worth asking.
+$NativeTtl = @{ webkit = 3 * 86400; versions = 7 * 86400 }
+
+# Fired no more often than this whatever happens, so a child that dies without
+# writing an answer cannot become a child every four seconds.
+$NativeRetrySeconds = 600
+$script:NativeAsked = [datetime]::MinValue
+
+function Test-NativeStale {
+    param($Record, [string]$What)
+    $entry = $null
+    if ($Record) { $entry = $Record.$What }
+    if (-not $entry -or $null -eq $entry.at) { return $true }
+    $now = [int64](([DateTime]::UtcNow - [DateTime]'1970-01-01').TotalSeconds)
+    return (($now - [int64]$entry.at) -gt $NativeTtl[$What])
+}
+
+function Start-NativeRefresh {
+    <#
+      Ask the vendors what they still serve, in a process of its own.
+
+      Never on the request path: the WebKit search is six requests and naming the
+      uncatalogued Chromium milestones is seventy, and a page that waited for
+      either would be a page that hangs when a CDN does. This is where server.py
+      starts a thread; here it has to be a child process, because the HTTP loop is
+      the only thread there is - so the work itself lives in the CLI, as
+      `engineshelf.ps1 refresh-native`, and nothing waits for it. The rows are
+      built from whatever the last answer was, so the shelf sharpens a few minutes
+      later rather than being late to draw.
+
+      One child for everything stale, not one per answer: they would each write
+      back the native record they read. It does share the catalog cache with the
+      `catalog` child started at startup, which is the same small hazard the shell
+      and Python sides carry - the loser of that race is one cache row, re-derived
+      the next time anything asks for it.
+    #>
+    param($Record)
+    if (((Get-Date) - $script:NativeAsked).TotalSeconds -lt $NativeRetrySeconds) { return }
+    $stale = @(@('webkit', 'versions') | Where-Object { Test-NativeStale $Record $_ })
+    if ($stale.Count -eq 0) { return }
+    $script:NativeAsked = Get-Date
+    try {
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList (
+            @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:Cli,
+              'refresh-native') + $stale) | Out-Null
+    } catch { }
+}
+
 function Get-NativeAvailable {
     param([string]$Engine, [string]$Ident)
     # Not a probe and not a guess: Get-EnginePlatforms is where the CLI keeps the
@@ -365,14 +432,31 @@ function Get-MilestoneOf {
     return $null
 }
 
+# `docker info` is the best part of a second, and the doctor report runs it on
+# every check - so the page asking for the state each second meant a `docker info`
+# each second. Cached for the 12 seconds server.py uses, and dropped when a job
+# ends: installing a dependency has to show up at once.
+$script:DoctorCache = @{ At = [datetime]::MinValue; Value = $null }
+$DoctorTtlSeconds = 12
+
+function Clear-DoctorCache { $script:DoctorCache.Value = $null }
+
 function Get-DoctorReport {
     # The checks live in lib/preflight.ps1 so the CLI, the Docker launcher and
     # this page cannot disagree about what is missing or how to fix it.
+    if ($script:DoctorCache.Value -and
+        ((Get-Date) - $script:DoctorCache.At).TotalSeconds -lt $DoctorTtlSeconds) {
+        return $script:DoctorCache.Value
+    }
     try {
-        return Get-PfReport
+        $report = Get-PfReport
     } catch {
+        # Not cached: a check that threw is not an answer, and the next request
+        # should try again rather than be told "nothing is wrong" for 12 seconds.
         return [ordered]@{ os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; components = @() }
     }
+    $script:DoctorCache = @{ At = (Get-Date); Value = $report }
+    return $report
 }
 
 # ---------- engines ----------
@@ -592,6 +676,10 @@ function Get-State {
     # Read once per state build, not once per row: 288 rows would otherwise open
     # the same small file 288 times.
     $script:NativeRecord = Get-NativeRecord
+    # Asked in the background, before the rows are built from whatever the last
+    # answer was: the first page load of a fresh install is exactly as fast as it
+    # was, and the shelf sharpens once the answer lands.
+    Start-NativeRefresh $script:NativeRecord
     $rows = New-Object System.Collections.ArrayList
     foreach ($engine in $Engines) {
         foreach ($release in $shelf[$engine]) {
@@ -658,7 +746,10 @@ function Get-State {
     # Summed over every engine, not over the rows above: those are Chromium's
     # catalogue, so a gauge built from them reported a 2.2 GB directory as 589 MB
     # the moment anything other than Chromium was installed.
-    $everything = Get-InstalledByKey
+    #
+    # The same $everything the rows were built from, deliberately: reading it a
+    # second time here walked every installed browser and every profile again, for
+    # a total that the first read already had the numbers for.
     $browserBytes = 0
     $profileBytes = 0
     foreach ($info in $everything.Values) {
@@ -854,6 +945,9 @@ function Start-Job2 {
     $script:Jobs[$id] = @{
         id = $id; kind = $Kind; revision = $Revision; label = $Label
         proc = $proc; out = $out; err = $err; stopping = $false
+        # Set by Get-JobState the first time it sees this job has ended, which is
+        # where the caches a finished job invalidates are dropped.
+        settled = $false
         # Which log this writes to, and which docker verb it is. The page reads
         # both off the job: a container's job ends as soon as the desktop
         # answers, so without the verb a stop that succeeded looked exactly like
@@ -966,9 +1060,27 @@ function Read-JobFile {
 }
 
 function Get-JobState {
-    <# Where a job has got to, without reading a byte of its output. #>
+    <# Where a job has got to, without reading a byte of its output.
+
+       Also the one place that notices a job has ended, because every path that
+       reports a job comes through here - including the state document, which is
+       asked for on a clock. A finished job has usually just changed a size, what
+       Docker holds, or whether a dependency is installed, and all three are
+       cached. Once per job: this is called several times a second.
+
+       It used to be noticed in Get-JobRecord instead, which the page only asks
+       for on jobs it draws progress for - and it skips dependency installs. So
+       the one job whose whole purpose is to change the doctor's answer was the
+       one job that never invalidated anything. #>
     param($Job)
     if (-not $Job.proc.HasExited) { return @{ status = 'running'; code = $null } }
+    if (-not $Job.settled) {
+        $Job.settled = $true
+        $script:DockerCache.Value = $null
+        $script:VolumeCache.Value = $null
+        Clear-SizeCache
+        Clear-DoctorCache
+    }
     $code = $Job.proc.ExitCode
     $status = if ($Job.stopping) { 'stopped' }
               elseif ($code -eq 0) { 'done' }
@@ -1005,6 +1117,18 @@ function Split-JobText {
     return $parts
 }
 
+# A download prints a meter frame twice a second - see Write-Meter in
+# engineshelf.ps1 - so three minutes of fetching is several hundred lines, and
+# every one of them says the same thing as the one before. Consecutive frames
+# collapse onto one line, which is the difference between a buffer that holds one
+# install and a buffer that holds a day of them. server.py does the same to
+# curl's meter; this recognises ours: a byte count, then a total or the word
+# "fetched", which nothing else the CLI prints starts with.
+function Test-MeterLine {
+    param([string]$Line)
+    return ($Line -match '^\s*\d[\d.]* [KMGT]?B (/|fetched)')
+}
+
 function Get-JobLines {
     <# One job's share of its stream: the divider, then its output.
 
@@ -1029,7 +1153,14 @@ function Get-JobLines {
     [void]$lines.Add('')
     [void]$lines.Add("$StreamRule$StreamRule $($Job.label) $StreamDot $($Job.startedAt) $StreamRule$StreamRule")
     [void]$lines.Add('')
-    foreach ($line in @(Split-JobText $text $running)) { [void]$lines.Add($line) }
+    foreach ($line in @(Split-JobText $text $running)) {
+        if ((Test-MeterLine $line) -and $lines.Count -gt 0 -and
+            (Test-MeterLine $lines[$lines.Count - 1])) {
+            $lines[$lines.Count - 1] = $line
+        } else {
+            [void]$lines.Add($line)
+        }
+    }
 
     $Job.lineCache = $lines
     $Job.lineFinal = -not $running
@@ -1153,14 +1284,9 @@ function Get-JobRecord {
         $chunk = Read-JobFile $file
         if ($chunk) { $text += $chunk }
     }
-    if ($job.proc.HasExited -and -not $job.settled) {
-        # A finished job has usually just changed what Docker holds, and the page
-        # asks for the state again the moment it sees the job end. Once per job:
-        # this is read on every poll, including polls of a job that ended long ago.
-        $job.settled = $true
-        $script:DockerCache.Value = $null
-        $script:VolumeCache.Value = $null
-    }
+    # Get-JobState is what notices the end of a job and drops the caches a
+    # finished job invalidates; it used to be done here, where only the jobs the
+    # page draws progress for ever reached it.
     $state = Get-JobState $job
     return @{ id = $job.id; kind = $job.kind; revision = $job.revision; label = $job.label
               status = $state.status; code = $state.code; stream = $job.stream
@@ -1676,7 +1802,10 @@ function Invoke-Route {
         '/api/docker' {
             $action = [string](Get-Field $body 'action')
             if (-not $action) { $action = 'start' }
-            if (@('start', 'build', 'stop', 'rebuild', 'purge') -notcontains $action) {
+            # 'clean' is the container's profile volume being reset. It was missing
+            # from this list while the page offered it and the launcher implemented
+            # it, so "Reset the container's profile" answered 400 on Windows.
+            if (@('start', 'build', 'stop', 'rebuild', 'clean', 'purge') -notcontains $action) {
                 Send-Json $Stream @{ error = 'bad action' } 400; return
             }
             # Every engine has a container. An unknown one still gets refused

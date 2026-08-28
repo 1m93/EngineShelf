@@ -98,5 +98,61 @@ for (const [engine, label, platform] of cases) {
   show(`${engine}: ready`, 'ready',
        readJob([downloading, 'Extracting...', `v ${label} ready.`].join('\n')).phase);
 }
-console.log(bad ? `\n${bad} FAILURES` : '\nall phases detected for all four engines');
+
+// The same round trip against engineshelf.ps1, which prints its own wording and
+// draws its own meter - there is no curl in the picture on Windows. Every line
+// below is what that file actually writes: Write-Info prints the message bare,
+// Write-Ok prefixes "OK ", and Write-Meter builds the meter out of Format-Bytes
+// and Format-Left. Nothing checked this before, and one of the two managers had
+// already drifted from the page by a whole feature.
+console.log('');
+const psMeter = '  100 MB / 232 MB \u00b7 16s left \u00b7 12 MB/s  43%';
+
+for (const [engine, label, platform] of cases) {
+  const downloading = [
+    '',
+    `Downloading ${label} (${platform}, one time only)`,
+    '-> C:\\Users\\you\\.engineshelf\\builds\\x',
+    '   ~60-300 MB, this can take a few minutes...',
+    '',
+    psMeter,
+  ].join('\n');
+  const info = readJob(downloading);
+  show(`${engine}: downloading (ps)`, { phase: 'downloading', percent: 43 },
+       { phase: info.phase, percent: info.percent });
+  // Word for word what the curl meter yields above, which is the point: one row
+  // reads the same whichever manager is behind it.
+  show(`${engine}: bytes+eta (ps)`, '100 MB / 232 MB · 16s left', info.detail);
+
+  const open = [downloading, 'Extracting...', `OK ${label} ready.`, '',
+                `  > ${label} (${platform})`, '  Profile: C:\\x', ''].join('\n');
+  show(`${engine}: open (ps)`, 'open', readJob(open).phase);
+
+  show(`${engine}: ready (ps)`, 'ready',
+       readJob([downloading, 'Extracting...', `OK ${label} ready.`].join('\n')).phase);
+}
+
+// A meter with nothing to estimate from, and one for a server that will not say
+// how big the file is. Both are shapes Write-Meter really emits.
+console.log('');
+const partial = [
+  '',
+  'Downloading Chromium 120.0.6099.0 (Win_x64, one time only)',
+  '',
+  '  1 KB / 232 MB  0%',
+].join('\n');
+show('ps meter with no estimate', { phase: 'downloading', percent: 0, detail: '1 KB / 232 MB' },
+     readJob(partial));
+
+const unknownSize = [
+  '',
+  'Downloading Chromium 120.0.6099.0 (Win_x64, one time only)',
+  '',
+  '  104 MB fetched \u00b7 13 MB/s',
+].join('\n');
+show('ps meter with no total', { phase: 'downloading', percent: null, detail: null },
+     readJob(unknownSize));
+
+console.log(bad ? `\n${bad} FAILURES`
+                : '\nall phases detected for all four engines, on both CLIs');
 process.exit(bad ? 1 : 0);
