@@ -80,8 +80,13 @@ function Resolve-DockerTarget {
         $parts = $Raw.Split(':', 2)
         $engine = $parts[0].ToLower(); $token = $parts[1]
     }
-    if ($Engines -notcontains $engine) {
-        Die "Unknown engine: $engine. Known: $($Engines -join ' ')"
+    # Through the helper, like engineshelf.ps1 does. This read $Engines, which is
+    # what the shell twin calls the list and what nothing on this side defines -
+    # so it was $null, `-notcontains` against $null is true for everything, and
+    # every Docker command died on "Unknown engine: <engine>. Known: " with an
+    # empty list. Not just one verb: every verb resolves its target through here.
+    if (-not (Test-EngineKnown $engine)) {
+        Die "Unknown engine: $engine. Known: $($EngineList -join ' ')"
     }
     if ($engine -ne 'chromium') { return Resolve-DockerOther $engine $token }
 
@@ -236,12 +241,24 @@ function Resolve-FirefoxLinux {
 <#
   Edge's Linux .deb, from the apt pool.
 
-  This is the whole reason an Edge container exists. Microsoft's enterprise feed
-  serves mac and Windows, holds about six months, and gates every file behind a
-  per-file GUID - so lib/engines.ps1 refuses Edge outright, correctly, because
-  nothing on Windows can be shelved. The pool has kept every .deb since 2021 at a
-  URL that can be constructed, so this is the only route to an old Edge from any
-  host.
+  This is the whole reason an Edge container exists.
+
+  Microsoft's enterprise feed serves all three, and holds about six months: 26
+  mac builds, 36 Windows, 27 Linux at the time of writing. What it serves each is
+  not the same kind of thing. The mac artifact is a .pkg and the Linux ones are
+  .deb and .rpm - archives, which a launcher can expand. The Windows artifact is
+  an .msi that installs no files of its own: no File table at all, a 12-byte
+  Component table, and a 258 MB Binary stream whose first two bytes are MZ - the
+  Chromium installer, run by a custom action. `msiexec /a` therefore extracts
+  nothing, and there is no archive of Edge for Windows anywhere in the feed.
+
+  So lib/engines.ps1 gives Edge no Windows platform, and that is correct. It is
+  worth spelling out because the reason written here used to be "the download URL
+  carries a per-file GUID", which is not it - the feed hands that URL out in its
+  own JSON, and lib/engines.sh follows it happily for the mac .pkg.
+
+  The apt pool has kept every .deb since 2021 at a URL that can be constructed, so
+  this is the only route to an old Edge from any host.
 #>
 function Resolve-EdgeLinux {
     param([string]$Token)
@@ -267,12 +284,15 @@ function Resolve-EdgeLinux {
     return @{ Version = $version; Url = "$pool/microsoft-edge-stable_$version-1_amd64.deb" }
 }
 
-# What to call this engine in a sentence.
+# What to call this engine in a sentence. Through lib/engines.ps1, which is where
+# every other caller gets it - this indexed $EngineNames, a table that exists on
+# the manager's side of the house and nowhere this file can see. Indexing $null
+# throws under `$ErrorActionPreference = 'Stop'`, so eight lines of ordinary
+# output were eight ways to end a Docker command in a stack trace - after the
+# work had been done, which is the worst place to put one.
 function Get-DockerLabel {
     param($engine)
-    $name = $EngineNames[$engine]
-    if ($name) { return $name }
-    return 'Chromium'
+    return (Get-EngineDisplay $engine)
 }
 
 # One build, however many --build-arg this engine needs.

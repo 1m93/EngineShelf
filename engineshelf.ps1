@@ -765,7 +765,11 @@ function Invoke-Catalog {
         Write-Host ("  {0,-6} {1,-16} r{2,-9} " -f $m, $version, $rev) -NoNewline
         Write-Host $state -ForegroundColor $colour
     }
-    foreach ($engine in $Engines) {
+    # $EngineList, from lib/engines.ps1. This read $Engines - what the shell twin
+    # calls it - which nothing on this side defines, so the loop walked $null and
+    # `catalog` listed Chromium and nothing else, under a footer advertising
+    # `run firefox:115`.
+    foreach ($engine in $EngineList) {
         if ($engine -ne 'chromium') { Show-EngineShelf $engine }
     }
     Write-Host ""
@@ -802,7 +806,10 @@ function Show-EngineShelf {
 
     $all = @($rows.Values | Sort-Object -Property { $_.date } -Descending)
     $years = @($all | ForEach-Object { $_.year } | Sort-Object -Unique -Descending)
-    $name = $EngineNames[$engine]
+    # Same slip as the loop above, one line further on: $EngineNames is the
+    # manager's lookup, not this file's. Indexing $null throws, so fixing the loop
+    # without this would have turned three missing engines into a crash.
+    $name = Get-EngineDisplay $engine
 
     Write-Host ""
     Write-Host "$name " -ForegroundColor White -NoNewline

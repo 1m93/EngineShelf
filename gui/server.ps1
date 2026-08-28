@@ -931,15 +931,26 @@ function Start-Job2 {
     $script:NextJob++
     $out = Join-Path $JobsDir "$id.out"
     $err = Join-Path $JobsDir "$id.err"
+    $in  = Join-Path $JobsDir "$id.in"
     # Truly empty, not an empty line: Set-Content would put a newline in each
     # file, and the log is rendered from them - so every run would open with a
     # blank line the other platforms do not have.
     [IO.File]::WriteAllText($out, '')
     [IO.File]::WriteAllText($err, '')
+    [IO.File]::WriteAllText($in, '')
 
     $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Script) + $CliArgs
+    # Nothing on the other end of stdin, which is what server.py gives every job
+    # with stdin=subprocess.DEVNULL. Without it the child inherits the manager's,
+    # and anything that asks a question waits for an answer that cannot arrive:
+    # winget wanting its source agreements accepted, sudo wanting a password
+    # inside WSL. The job never ends, prints nothing after the question, and only
+    # does it on Windows - which is how it went unnoticed. An empty file rather
+    # than NUL: it is a real handle that reads EOF on any Windows, and the job
+    # directory is already ours.
     $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs `
         -WorkingDirectory $Project -PassThru -WindowStyle Hidden `
+        -RedirectStandardInput $in `
         -RedirectStandardOutput $out -RedirectStandardError $err
 
     $script:Jobs[$id] = @{

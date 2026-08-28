@@ -73,7 +73,17 @@ function Get-PfFix {
     # admin rights and a reboot, and its licence is only free for small companies;
     # this tool asks for none of that on the other platforms and will not here.
     # The engine the CLI talks to is a separate decision - see Get-PfNote.
-    if (Test-Have winget) { return 'winget install -e --id Docker.DockerCLI' }
+    # Every prompt accepted up front. winget asks about its source agreements the
+    # first time it is used and about a package's licence terms after that, and
+    # the manager runs this with nothing on stdin - so an unanswered question is
+    # not a refusal, it is a job that sits at "installing..." for ever, printing
+    # nothing after the command it announced. --silent keeps the underlying
+    # installer from opening a window inside a hidden process, where nobody could
+    # click it either.
+    if (Test-Have winget) {
+        return 'winget install -e --id Docker.DockerCLI ' +
+               '--accept-source-agreements --accept-package-agreements --silent'
+    }
     return ''
 }
 

@@ -258,7 +258,13 @@ const WORK_WORD = {
    and they are the same act on the two routes. Stopping is excluded for a second
    reason - interrupting `docker stop` leaves the browser inside holding the lock
    in its profile volume, which is what made a version permanently unstartable. */
-const CANCELLABLE = new Set(['install', 'launch', 'docker']);
+// 'doctor' is in here for a different reason than the rest. A dependency install
+// is somebody else's installer - winget, brew, the Docker convenience script -
+// and however carefully it is invoked, the day it stops and waits for something
+// is the day this job runs until the manager is quit. The others are cancellable
+// because calling them off costs nothing; this one is cancellable because there
+// has to be a way out of it.
+const CANCELLABLE = new Set(['install', 'launch', 'docker', 'doctor']);
 const DOCKER_FINAL = new Set(['stop', 'clean', 'purge']);
 
 const cancellable = (job) =>
@@ -1078,6 +1084,18 @@ function nativeRoute(row) {
     return ['off', 'Native: no build of this version exists for this machine.'];
   }
   if (row.nativeGone && !row.installed) {
+    // Edge on Windows is not the same answer as Edge on a mac, and saying the
+    // feed has nothing left is untrue there: it serves current Windows Edge, as
+    // an installer. Nothing is missing and nothing will change - which is worth
+    // saying plainly, because the mac wording reads as "wait for the vendor".
+    if (row.engine === 'edge' && state && state.os === 'windows') {
+      return [
+        'off',
+        'Native: not on Windows. Microsoft ships Edge here as an installer ' +
+          'rather than an archive, so there is nothing to put on the shelf. The ' +
+          'container runs the Linux build instead.',
+      ];
+    }
     return [
       'off',
       row.engine === 'edge'
@@ -1790,6 +1808,26 @@ function renderGroup(group) {
   return section;
 }
 
+// Both ways of running this version are closed, so the row has no button worth
+// drawing - the same state a version with no build for this machine has always
+// been in, reached by the other road.
+//
+// Its own function because it is the rule "a row never offers a dead end", and
+// tools/check-rows.mjs pins it. Written inline, it had covered only the catalog's
+// half: a vendor that has stopped serving a version leaves exactly as little to
+// download as a version that never had a build here, and `dockerOnly` is false on
+// a machine with no Docker - so the cascade fell through to the plain native Get,
+// on a row whose own tooltip said there was nothing left to download. Every Edge
+// row on Windows sits in that state, and so does an aged-out Edge or WebKit on a
+// mac.
+//
+// Installed is not in it: a build already on disk still launches after the vendor
+// has forgotten it, which is half the point of the shelf.
+function nothingToOffer(row) {
+  const nowhereNative = !row.supported || (row.nativeGone && !row.installed);
+  return nowhereNative && !row.dockerOnly && !row.dockerImage && !row.installed;
+}
+
 function renderRow(row) {
   const node = $('row-template').content.firstElementChild.cloneNode(true);
 
@@ -1960,7 +1998,7 @@ function renderRow(row) {
   // with no build for this machine still runs in a container, so it keeps its
   // buttons - it was the greyed-out rows with no way to open them that made the
   // whole shelf look shorter than it is.
-  if (!row.supported && !row.dockerOnly) {
+  if (nothingToOffer(row)) {
     node.classList.add('unsupported');
   } else {
     if (!row.supported) node.classList.add('docker-only');
