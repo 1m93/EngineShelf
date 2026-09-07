@@ -4,22 +4,26 @@
 #
 $ErrorActionPreference = 'Stop'
 
-$LiftFrom = './gui/server.ps1'
+$LiftFrom = @('./gui/server.ps1', './lib/preflight.ps1')
 $LiftFunctions = @(
     'Get-StreamKey', 'Get-StreamLabel', 'Resolve-Stream', 'Get-StreamUpdated',
     'Remove-IdleStreams', 'Get-JobState', 'Get-JobBrief', 'Split-JobText',
     'Test-MeterLine', 'Get-JobLines', 'Get-StreamJobs', 'Get-StreamRunning',
     'Get-StreamLatest', 'Get-StreamLog', 'Get-StreamList', 'Read-JobFile',
-    'Get-Field', 'Clear-SizeCache', 'Clear-DoctorCache'
+    'Get-Field', 'Clear-SizeCache', 'Clear-DoctorCache', 'Quote-Args',
+    'Clear-DockerRoute', 'Get-DockerRoute'
 )
 $LiftVariables = @(
     'StreamLines', 'StreamMax', 'StreamRule', 'StreamDot', 'StreamPattern',
-    'Streams', 'SizeCache', 'DoctorCache', 'DockerCache', 'VolumeCache'
+    'Streams', 'SizeCache', 'DoctorCache', 'DockerCache', 'VolumeCache',
+    'PfDockerRoute'
 )
 . "$PSScriptRoot/harness.ps1"
 
 $script:Jobs = @{}
 $script:next = 1
+
+
 
 $JobsDir = Join-Path ([IO.Path]::GetTempPath()) ("es-stream-test-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $JobsDir | Out-Null

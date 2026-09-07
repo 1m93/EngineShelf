@@ -923,11 +923,8 @@ function Invoke-Run {
     Write-Host "  Log: $log" -ForegroundColor DarkGray
     Write-Host ""
 
-    # Start-Process joins -ArgumentList with plain spaces and does not quote, so
-    # any argument containing a space (a profile path under "C:\Users\Some Name")
-    # would arrive at Chromium split into pieces.
-    function Quote-Args { param($items) $items | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } } }
-
+    # Quote-Args is in lib/preflight.ps1 now: every Start-Process in the tool
+    # needs it, not just this one.
     $attempt = 0; $fastCrashes = 0
     $launchArgs = $browserArgs
     if ($url -ne '') { $launchArgs = $browserArgs + $url }

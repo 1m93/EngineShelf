@@ -169,6 +169,42 @@ No Linux x86_64 build of Chromium $milestone is available. It is in neither the
   95 at any price. The Linux apt pool has kept every .deb since 2021. For an old
   Edge this image is not an alternative, it is the only route.
 #>
+# Which Ubuntu release a WebKit revision was published for. The base and the
+# archive have to match - the focal archive in a jammy image dies at launch on
+# libvpx.so.6 - so this decides both, and getting it wrong is a container that
+# builds and then cannot start.
+#
+# It was written as a boundary: below r1724 focal, at or above it jammy. Measured
+# against the CDN one revision at a time, availability is not a boundary and is
+# not even monotonic - r1908 exists only for focal, in the middle of the jammy
+# range; r1751, r1944 and r1992 only for jammy, where their neighbours have both;
+# r1668 and r1715 for nothing at all. Any rule short of asking is wrong for some
+# row, and the ones it is wrong for are the ones nobody thinks to test.
+#
+# So it asks. Three requests against a CDN, on a path that is about to download
+# a hundred megabytes from the same CDN. Preference order rather than newest
+# first: 22.04 and 20.04 are the two releases this image has been built and run
+# against, and 24.04 is a fallback for a revision published for nothing else.
+# Keep it in step with WEBKIT_BASES in engineshelf-docker.sh -
+# tools/check-parity.mjs holds the two to each other.
+$WebKitBases = @('22.04', '20.04', '24.04')
+
+# Empty when nothing was published for this revision, which the caller has to
+# tell apart from a release name. $null would do the same, but an empty string
+# survives the trip through Die's message building without becoming the word
+# "null" in front of somebody.
+function Get-WebKitUbuntu {
+    param([string]$Revision)
+    $n = 0
+    if (-not [int]::TryParse($Revision, [ref]$n)) { return '22.04' }
+    foreach ($release in $WebKitBases) {
+        if (Test-UrlExists "$WebKitCdn/$Revision/webkit-ubuntu-$release.zip") {
+            return $release
+        }
+    }
+    return ''
+}
+
 function Resolve-DockerOther {
     param([string]$engine, [string]$token)
 
@@ -198,7 +234,14 @@ function Resolve-DockerOther {
             Engine = 'webkit'; Milestone = '?'; Version = $label; Revision = $revision
             Key = "webkit-$revision"; BuildId = "r$revision"
             Dockerfile = 'Dockerfile.webkit'
-            BuildArgs = @("REVISION=$revision", 'WEBKIT_PLATFORM=ubuntu-22.04')
+            # UBUNTU is not here, though the Dockerfile needs it: it costs three
+            # requests to work out and this function runs on `stop` and `status`
+            # too. Invoke-Build appends it, which is the same place the shell
+            # twin's build_image resolves it. WEBKIT_PLATFORM used to be pinned
+            # here to the value the Dockerfile already defaulted to, which did
+            # nothing except make the two launchers hand docker different
+            # arguments for the same build.
+            BuildArgs = @("REVISION=$revision")
         }
     }
 
@@ -296,13 +339,37 @@ function Get-DockerLabel {
 }
 
 # One build, however many --build-arg this engine needs.
+#
+# The Dockerfile and the build context are the only host paths anything here
+# hands to docker - profiles are named volumes, not mounts - so they are also the
+# only thing that has to be renamed when docker is inside WSL. Everything else in
+# this file is image, container and volume names, which read the same either side.
 function Invoke-Build {
     param($target, [string]$image, [string[]]$extra)
-    $argv = @('build') + $extra + @('--platform', 'linux/amd64',
-        '-f', (Join-Path $DockerDir $target.Dockerfile))
-    foreach ($a in $target.BuildArgs) { $argv += @('--build-arg', $a) }
-    $argv += @('-t', $image, $DockerDir)
-    & docker @argv
+    $dockerfile = Join-Path $DockerDir $target.Dockerfile
+    $context = $DockerDir
+    if ((Get-DockerRoute) -eq 'wsl') {
+        $dockerfile = ConvertTo-WslPath $dockerfile
+        $context = ConvertTo-WslPath $context
+    }
+    $argv = @('build') + $extra + @('--platform', 'linux/amd64', '-f', $dockerfile)
+    # Asked here rather than at resolve time, so `stop` and `status` stay
+    # offline - the same split build_image makes in the shell twin.
+    $buildArgs = @($target.BuildArgs)
+    if ($target.Engine -eq 'webkit') {
+        $base = Get-WebKitUbuntu $target.Revision
+        if (-not $base) {
+            Die "Playwright published no Linux build of WebKit r$($target.Revision).
+   Tried ubuntu-$($WebKitBases -join ', ubuntu-').
+   Every revision is published for some releases and not others, and r1668 and
+   r1715 were published for none - there is nothing to put in a container. The
+   native launcher is unaffected where it has a build for this machine."
+        }
+        $buildArgs += "UBUNTU=$base"
+    }
+    foreach ($a in $buildArgs) { $argv += @('--build-arg', $a) }
+    $argv += @('-t', $image, $context)
+    Invoke-DockerHere @argv
 }
 
 # These three names are the whole contract between this script and the manager:
@@ -317,7 +384,7 @@ function Get-VolumeName    { param($rev) "engineshelf-profile-$rev" }
 # rather than recomputing and guessing wrong.
 function Get-RunningPort {
     param($rev)
-    $mapping = docker port (Get-ContainerName $rev) 6080 2>$null
+    $mapping = Invoke-DockerHere port (Get-ContainerName $rev) 6080 2>$null
     if (-not $mapping) { return $null }
     return ($mapping -split ':')[-1].Trim()
 }
@@ -379,13 +446,13 @@ function Start-Container {
         # The virtual screen, when one was asked for. Unset means the image's own
         # default, which is what every container built so far has run.
         if ($script:ScreenArg) { $extra += @('-e', "SCREEN=$($script:ScreenArg)") }
-        $output = docker run -d --name $Container --platform linux/amd64 `
+        $output = Invoke-DockerHere run -d --name $Container --platform linux/amd64 `
             -p "127.0.0.1:${port}:6080" -v "${Volume}:/data" `
             --add-host 'host.docker.internal:host-gateway' --shm-size=1g @extra $Image 2>&1
         if ($LASTEXITCODE -eq 0) { return $port }
         # A named container that failed to start still exists, and the next
         # attempt cannot reuse the name until it is gone.
-        docker rm -f $Container 2>&1 | Out-Null
+        Invoke-DockerHere rm -f $Container 2>&1 | Out-Null
         $text = ($output | Out-String)
         if ($text -match 'already allocated|address already in use|Bind for') {
             $floor = $port + 1
@@ -413,7 +480,7 @@ function Invoke-ImageOnly {
     Write-Host "  $(Get-DockerLabel $target.Engine) $($target.Version) in Docker (image only)" -ForegroundColor White
     Write-Host ""
     if (-not $ForceBuild) {
-        docker image inspect $image 2>&1 | Out-Null
+        Invoke-DockerHere image inspect $image 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "The image is already built. Run it with: .\engineshelf-docker.ps1 start $Selector"
             return
@@ -438,7 +505,7 @@ function Invoke-Start {
     $container = Get-ContainerName $target.Key
     $volume    = Get-VolumeName $target.Key
 
-    $running = docker ps --format '{{.Names}}' 2>$null
+    $running = Invoke-DockerHere ps --format '{{.Names}}' 2>$null
     if ($running -contains $container) {
         $port = Get-RunningPort $target.Key
         $url = "http://localhost:$port/vnc.html?autoconnect=1&resize=scale"
@@ -447,7 +514,7 @@ function Invoke-Start {
         Start-Process $url | Out-Null
         return
     }
-    docker rm -f $container 2>&1 | Out-Null
+    Invoke-DockerHere rm -f $container 2>&1 | Out-Null
 
     Write-Host ""
     Write-Host "  $(Get-DockerLabel $target.Engine) $($target.Version) in Docker (Linux x86_64 $($target.BuildId))" -ForegroundColor White
@@ -456,7 +523,7 @@ function Invoke-Start {
     # Build only when the image is missing or a rebuild was asked for: a
     # from-scratch build is a multi-minute wait.
     $haveImage = $true
-    docker image inspect $image 2>&1 | Out-Null
+    Invoke-DockerHere image inspect $image 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { $haveImage = $false }
 
     if ($ForceBuild) {
@@ -481,10 +548,10 @@ function Invoke-Start {
             $ok = $true
             break
         } catch { }
-        $alive = docker ps --format '{{.Names}}' 2>$null
+        $alive = Invoke-DockerHere ps --format '{{.Names}}' 2>$null
         if ($alive -notcontains $container) {
             Write-Host ""
-            docker logs --tail 20 $container
+            Invoke-DockerHere logs --tail 20 $container
             Die "The container exited while starting."
         }
         Write-Host "." -NoNewline
@@ -527,13 +594,13 @@ switch -Regex ($Command) {
         # profile. A container removed outright left a lock in the profile volume
         # that stopped the next start of this version dead; the entrypoint clears
         # a stale one now, but stopping politely is still the right way round.
-        $live = docker ps --format '{{.Names}}' 2>$null
+        $live = Invoke-DockerHere ps --format '{{.Names}}' 2>$null
         if ($live -contains $container) {
-            docker stop -t 12 $container 2>&1 | Out-Null
-            docker rm -f $container 2>&1 | Out-Null
+            Invoke-DockerHere stop -t 12 $container 2>&1 | Out-Null
+            Invoke-DockerHere rm -f $container 2>&1 | Out-Null
             Write-Ok "Stopped $(Get-DockerLabel $target.Engine) $($target.Version)."
         } else {
-            docker rm -f $container 2>&1 | Out-Null
+            Invoke-DockerHere rm -f $container 2>&1 | Out-Null
             Write-Host "$(Get-DockerLabel $target.Engine) $($target.Version) was not running." -ForegroundColor DarkGray
         }
         break
@@ -541,17 +608,17 @@ switch -Regex ($Command) {
     '^logs$' {
         $target = Resolve-DockerTarget $Selector
         Test-Docker
-        docker logs -f (Get-ContainerName $target.Key)
+        Invoke-DockerHere logs -f (Get-ContainerName $target.Key)
         break
     }
     '^(list|ls|ps)$' {
         Test-Docker
         Write-Host ""
         Write-Host "Containers" -ForegroundColor White
-        docker ps -a --filter 'name=engineshelf-' --format '  {{.Names}}`t{{.Status}}`t{{.Ports}}'
+        Invoke-DockerHere ps -a --filter 'name=engineshelf-' --format '  {{.Names}}`t{{.Status}}`t{{.Ports}}'
         Write-Host ""
         Write-Host "Images" -ForegroundColor White
-        docker images 'engineshelf' --format '  {{.Repository}}:{{.Tag}}`t{{.Size}}'
+        Invoke-DockerHere images 'engineshelf' --format '  {{.Repository}}:{{.Tag}}`t{{.Size}}'
         Write-Host ""
         break
     }
@@ -561,18 +628,18 @@ switch -Regex ($Command) {
         # is this version's own, so that goes first.
         $target = Resolve-DockerTarget $Selector
         Test-Docker
-        docker rm -f (Get-ContainerName $target.Key) 2>&1 | Out-Null
-        docker volume rm -f (Get-VolumeName $target.Key) 2>&1 | Out-Null
+        Invoke-DockerHere rm -f (Get-ContainerName $target.Key) 2>&1 | Out-Null
+        Invoke-DockerHere volume rm -f (Get-VolumeName $target.Key) 2>&1 | Out-Null
         Write-Ok "Profile reset for $(Get-DockerLabel $target.Engine) $($target.Version) in Docker."
         break
     }
     '^purge$' {
         $target = Resolve-DockerTarget $Selector
         Test-Docker
-        docker rm -f (Get-ContainerName $target.Key) 2>&1 | Out-Null
-        docker rmi -f (Get-ImageName $target.Key) 2>&1 | Out-Null
+        Invoke-DockerHere rm -f (Get-ContainerName $target.Key) 2>&1 | Out-Null
+        Invoke-DockerHere rmi -f (Get-ImageName $target.Key) 2>&1 | Out-Null
         if ($Rest -contains '--with-profile') {
-            docker volume rm -f (Get-VolumeName $target.Key) 2>&1 | Out-Null
+            Invoke-DockerHere volume rm -f (Get-VolumeName $target.Key) 2>&1 | Out-Null
         }
         Write-Ok "Removed the Docker image for $(Get-DockerLabel $target.Engine) $($target.Version)."
         break

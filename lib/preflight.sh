@@ -103,6 +103,10 @@ pf_status_docker() {
   if docker info >/dev/null 2>&1; then PF_STATUS=ok; else PF_STATUS=inactive; fi
 }
 
+# Not a thing outside Windows, where the Docker edition needs it to have a Linux
+# machine to run in. Here the machine already is one, or is close enough.
+pf_status_wsl() { PF_STATUS=na; }
+
 pf_status_rosetta() {
   pf_is_arm_mac || { PF_STATUS=na; return; }
   # Actually running an x86_64 binary is the only answer that means anything;
@@ -116,6 +120,7 @@ pf_label() {
     curl)    printf 'curl\n' ;;
     unzip)   printf 'unzip\n' ;;
     docker)  printf 'Docker\n' ;;
+    wsl)     printf 'WSL 2\n' ;;
     rosetta) printf 'Rosetta 2\n' ;;
   esac
 }
@@ -127,6 +132,7 @@ pf_need() {   # required | recommended | optional
     python3) printf 'recommended\n' ;;
     rosetta) printf 'recommended\n' ;;
     docker)  printf 'optional\n' ;;
+    wsl)     printf 'optional\n' ;;
   esac
 }
 
@@ -136,6 +142,7 @@ pf_why() {
     curl)    printf 'Downloads the browser archives. Nothing can be installed without it.\n' ;;
     unzip)   printf 'Extracts the downloaded archives on Linux.\n' ;;
     docker)  printf 'Only for the Docker edition, which avoids Rosetta on Apple Silicon.\n' ;;
+    wsl)     printf 'Windows only - it is how Windows gets a Linux machine to run containers in.\n' ;;
     rosetta) printf 'Runs the x86_64 builds - every milestone up to 90 - on Apple Silicon.\n' ;;
   esac
 }
@@ -202,7 +209,10 @@ pf_fix_note() {
   esac
 }
 
-PF_COMPONENTS="curl unzip python3 rosetta docker"
+# wsl is Windows' only route to a Linux machine, so it is a component there and
+# nothing here. Listed all the same: lib/preflight.ps1 answers for the same set,
+# and tools/check-parity.mjs holds the two lists to each other.
+PF_COMPONENTS="curl unzip python3 rosetta wsl docker"
 
 # ---------- reporting ----------
 pf_symbol() {

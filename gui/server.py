@@ -520,6 +520,12 @@ def read_shelf():
                     "id": parts[3],
                     "label": parts[4],
                     "date": parts[5],
+                    # WebKit only, and only from a catalog new enough to carry
+                    # it: which Ubuntu releases this revision was published for.
+                    # "-" means none, which is the one answer that closes the
+                    # Docker route; absent means nobody asked, which closes
+                    # nothing. See shelf_row() in tools/discover.py.
+                    "bases": parts[6] if len(parts) > 6 else "",
                 })
     for releases in shelf.values():
         releases.sort(key=lambda r: r["date"], reverse=True)
@@ -946,7 +952,17 @@ def shelf_row(engine, release, installed, builds, hosts, notes, docker,
         # is tagged with the same key the build directory uses - so the row can
         # see it without a second lookup. Chromium is the exception above: its
         # container runs a Linux revision this host never installs.
-        row["docker"] = docker_row(row["key"], docker, row["selector"])
+        #
+        # Except that a WebKit container is built from a Linux archive, and for
+        # two revisions Playwright published none - so the row would offer a
+        # build that spends a minute on a base image and then fails on the
+        # download. That is the dead end CLAUDE.md's second rule is about, and
+        # the catalog is where the answer lives; see shelf_row() in
+        # tools/discover.py.
+        if engine == "webkit" and release.get("bases") == "-":
+            row["docker"] = None
+        else:
+            row["docker"] = docker_row(row["key"], docker, row["selector"])
 
     local = installed.get(row["key"]) if row["key"] else None
     row["installed"] = local is not None

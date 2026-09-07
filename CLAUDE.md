@@ -55,10 +55,25 @@ to exist along the whole chain — **page → both managers → both launchers**
   `dockerOnly` is false wherever Docker is missing, so "nothing left to download"
   used to fall through to the plain native Get — `nothingToOffer()` in `app.js` is
   where that is decided now, and `tools/check-rows.mjs` pins it.
+- **What a vendor publishes is not a rule — ask, and write the answer down.**
+  Availability is per version and per platform and it is not monotonic in either.
+  A boundary constant is always wrong for some row, and the rows it is wrong for
+  are the ones nobody thinks to test. Ask at the point of use where the answer is
+  cheap (the launcher is about to download from the same CDN), and record it in
+  `catalog.tsv` where the page needs it before the button is pressed —
+  `tools/discover.py` is what refreshes it.
 
 > The page offered "Reset the container's profile" → `action: 'clean'`, the
 > launcher implemented `clean`, and the allow-list in `gui/server.ps1` did not
 > have the verb. A dead button, on Windows only, with nothing to say why.
+>
+> `WEBKIT_FOCAL_BELOW = 1724` said which Ubuntu image a WebKit container was
+> built from. Measured revision by revision, it was wrong for five of fifty-three
+> rows: r1908 is focal-only *above* the boundary, r1751/r1944/r1992 jammy-only
+> below it, and r1668 and r1715 were published for no Linux release at all — two
+> rows offering a build that spent a minute on a base image and then 404ed. The
+> mismatched pairs were worse: the archive unpacked, the image built, and
+> MiniBrowser died at exec on `libvpx.so.6` ten minutes later.
 
 ## 3. A divergence is allowed only when it is written down
 
@@ -111,10 +126,11 @@ node tools/check-phases.mjs                        # CLI wording ↔ what the pa
 pwsh -NoProfile -File tools/check-windows.ps1      # the Windows half, from any machine
 ```
 
-The last one runs `tools/check-psvars.ps1` first, then four suites out of
-`tools/windows-tests/` that lift the real functions out of `gui/server.ps1` and
-`engineshelf.ps1` by parse tree and run them against stubs — so what is tested is
-what ships. On Windows it is `powershell -File tools\check-windows.ps1`.
+The last one runs `tools/check-psvars.ps1` first, then six suites out of
+`tools/windows-tests/` that lift the real functions out of `gui/server.ps1`,
+`engineshelf.ps1`, `engineshelf-docker.ps1` and `lib/preflight.ps1` by parse tree
+and run them against stubs — so what is tested is what ships. On Windows it is
+`powershell -File tools\check-windows.ps1`.
 
 The Windows scripts will also run under `pwsh` on macOS, which is worth doing when
 a change touches one, but they need the two things a Windows shell always has:

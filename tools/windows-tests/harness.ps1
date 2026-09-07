@@ -13,8 +13,14 @@
 #
 $ErrorActionPreference = 'Stop'
 
-$liftPath = (Resolve-Path $LiftFrom).Path
-$liftAst = [System.Management.Automation.Language.Parser]::ParseFile($liftPath, [ref]$null, [ref]$null)
+# One file or several. server.ps1 dot-sources lib/preflight.ps1 at runtime, so a
+# test of server.ps1 has to reach into it too - with the real function, not a
+# stand-in that can drift away from it.
+$liftAsts = @()
+foreach ($liftOne in @($LiftFrom)) {
+    $liftAsts += [System.Management.Automation.Language.Parser]::ParseFile(
+        (Resolve-Path $liftOne).Path, [ref]$null, [ref]$null)
+}
 
 # $LiftInspect names functions whose parse tree is wanted without defining them:
 # a stub stands in for the real one, and the test asserts the two still agree.
@@ -23,9 +29,13 @@ if (-not (Get-Variable -Name LiftInspect -Scope Local -ErrorAction SilentlyConti
 }
 
 $liftFound = @{}
-foreach ($fn in $liftAst.FindAll({
-    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
-}, $true)) {
+$liftFns = @()
+foreach ($one in $liftAsts) {
+    $liftFns += @($one.FindAll({
+        $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true))
+}
+foreach ($fn in $liftFns) {
     if ($LiftFunctions -contains $fn.Name) {
         $liftFound[$fn.Name] = $fn
         Invoke-Expression $fn.Extent.Text
@@ -43,7 +53,9 @@ foreach ($name in $LiftFunctions) {
 # Top-level assignments only - the ones that are script state when the real file
 # runs. Anything inside a function belongs to that function.
 $liftSeen = @{}
-foreach ($node in $liftAst.EndBlock.Statements) {
+$liftTop = @()
+foreach ($one in $liftAsts) { $liftTop += @($one.EndBlock.Statements) }
+foreach ($node in $liftTop) {
     if ($node -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
     $target = $node.Left
     if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }

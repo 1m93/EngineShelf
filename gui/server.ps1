@@ -94,7 +94,8 @@ function Read-Catalog {
 function Update-CatalogCache {
     try {
         Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:Cli, 'catalog') | Out-Null
+            -ArgumentList (Quote-Args @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                        '-File', $script:Cli, 'catalog')) | Out-Null
     } catch { }
 }
 
@@ -161,7 +162,7 @@ function Get-DockerVolumeSizes {
     }
     $sizes = @{}
     try {
-        $raw = docker system df -v --format '{{json .Volumes}}' 2>$null
+        $raw = Invoke-DockerHere system df -v --format '{{json .Volumes}}' 2>$null
         if ($LASTEXITCODE -eq 0 -and $raw) {
             foreach ($volume in (@($raw) -join '' | ConvertFrom-Json)) {
                 if ($volume.Name -like "$VolumePrefix*") {
@@ -188,12 +189,16 @@ function Get-DockerStatus {
         return $script:DockerCache.Value
     }
 
-    $hasCli = $null -ne (Get-Command docker -ErrorAction SilentlyContinue)
+    # Not "is docker.exe on the PATH": on Windows the engine usually lives inside
+    # WSL and there is no docker.exe at all. The page reads this as
+    # `state.docker.cli` and hangs the whole Docker half of every row off it, so
+    # asking the wrong question here greys out a route that works.
+    $hasCli = (Get-DockerRoute) -ne ''
     $running = $false
     $containers = @()
     $byRevision = @{}
     if ($hasCli) {
-        docker info 2>&1 | Out-Null
+        Invoke-DockerHere info 2>&1 | Out-Null
         $running = ($LASTEXITCODE -eq 0)
     }
 
@@ -216,7 +221,7 @@ function Get-DockerStatus {
         # images` and `docker system df` both said 1.49 GB and 1.96 GB. A gauge
         # that exists to show what is filling the disk cannot be off by four
         # times, so a rounded true number beats an exact wrong one.
-        $rows = @(docker images $ImageRepo --format '{{.Tag}}|{{.Size}}' 2>$null)
+        $rows = @(Invoke-DockerHere images $ImageRepo --format '{{.Tag}}|{{.Size}}' 2>$null)
         foreach ($row in $rows) {
             $parts = $row -split '\|'
             if ($parts.Count -lt 2 -or -not $parts[0] -or $parts[0] -eq '<none>') { continue }
@@ -227,7 +232,7 @@ function Get-DockerStatus {
         # One container per version, named engineshelf-<revision>. Stopped
         # ones are listed too: a container that exits the moment it starts is a
         # fault worth showing, not a row that quietly does nothing.
-        $listing = @(docker ps -a --filter "name=$ContainerPrefix" `
+        $listing = @(Invoke-DockerHere ps -a --filter "name=$ContainerPrefix" `
                      --format '{{.Names}}|{{.State}}|{{.Status}}|{{.Ports}}' 2>$null)
         foreach ($line in $listing) {
             $parts = $line -split '\|'
@@ -328,8 +333,8 @@ function Start-NativeRefresh {
     $script:NativeAsked = Get-Date
     try {
         Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList (
-            @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:Cli,
-              'refresh-native') + $stale) | Out-Null
+            Quote-Args (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                          $script:Cli, 'refresh-native') + $stale)) | Out-Null
     } catch { }
 }
 
@@ -513,9 +518,16 @@ function Read-Shelf {
             $key = "$engine/$($f[3])"
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
+            # WebKit only, and only from a catalog new enough to carry it: which
+            # Ubuntu releases this revision was published for. '-' means none,
+            # which is the one answer that closes the Docker route; absent means
+            # nobody asked, which closes nothing. See shelf_row() in
+            # tools/discover.py.
+            $bases = ''
+            if ($f.Count -gt 6) { $bases = $f[6] }
             [void]$shelf[$engine].Add(@{
                 engine = $engine; year = [int]$f[2]; id = $f[3]
-                label = $f[4]; date = $f[5]
+                label = $f[4]; date = $f[5]; bases = $bases
             })
         }
     }
@@ -644,7 +656,18 @@ function Get-ShelfRow {
         # is tagged with the same key the build directory uses - so the row can
         # see it without a second lookup. Chromium is the exception above: its
         # container runs a Linux revision this host never installs.
-        $row.docker = Get-DockerRow $row.key $docker $row.selector
+        #
+        # Except that a WebKit container is built from a Linux archive, and for
+        # two revisions Playwright published none - so the row would offer a
+        # build that spends a minute on a base image and then fails on the
+        # download. That is the dead end CLAUDE.md's second rule is about, and
+        # the catalog is where the answer lives; see shelf_row() in
+        # tools/discover.py.
+        if ($engine -eq 'webkit' -and $release.bases -eq '-') {
+            $row.docker = $null
+        } else {
+            $row.docker = Get-DockerRow $row.key $docker $row.selector
+        }
     }
 
     $local = $null
@@ -948,7 +971,7 @@ function Start-Job2 {
     # does it on Windows - which is how it went unnoticed. An empty file rather
     # than NUL: it is a real handle that reads EOF on any Windows, and the job
     # directory is already ours.
-    $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs `
+    $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList (Quote-Args $psArgs) `
         -WorkingDirectory $Project -PassThru -WindowStyle Hidden `
         -RedirectStandardInput $in `
         -RedirectStandardOutput $out -RedirectStandardError $err
@@ -1091,6 +1114,10 @@ function Get-JobState {
         $script:VolumeCache.Value = $null
         Clear-SizeCache
         Clear-DoctorCache
+        # Somebody may have just installed Docker, or WSL. Where docker lives is
+        # remembered because deciding costs a `docker info`, and a finished job is
+        # exactly when that answer can have changed.
+        Clear-DockerRoute
     }
     $code = $Job.proc.ExitCode
     $status = if ($Job.stopping) { 'stopped' }
@@ -1529,19 +1556,21 @@ function Open-AppWindow {
         '--disable-features=Translate'
     )
     try {
-        return Start-Process -FilePath $browser -ArgumentList $argv -PassThru
+        # --user-data-dir carries $Root, and a Windows username with a space in it
+        # is the common case, not the odd one.
+        return Start-Process -FilePath $browser -ArgumentList (Quote-Args $argv) -PassThru
     } catch {
         return $null
     }
 }
 
 function Get-RunningContainers {
-    # No docker on the machine means nothing of ours can be running - and a bare
+    # No docker anywhere means nothing of ours can be running - and a bare
     # `docker` call would throw CommandNotFoundException, which 2>$null does not
     # catch. This runs at startup (Set-InheritedContainers) before anything is
     # wrapped in a request handler, so an unguarded call takes the manager down.
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return @() }
-    return @(docker ps --filter "name=$ContainerPrefix" --format '{{.Names}}' 2>$null |
+    if ((Get-DockerRoute) -eq '') { return @() }
+    return @(Invoke-DockerHere ps --filter "name=$ContainerPrefix" --format '{{.Names}}' 2>$null |
              Where-Object { $_ -like "$ContainerPrefix*" })
 }
 
@@ -1570,8 +1599,8 @@ function Stop-Containers {
     if (-not $names.Count) { return }
     $plural = if ($names.Count -gt 1) { 's' } else { '' }
     Write-Host "  Stopping $($names.Count) Docker container$plural..."
-    docker stop -t 10 @names 2>&1 | Out-Null
-    docker rm -f @names 2>&1 | Out-Null
+    Invoke-DockerHere stop -t 10 @names 2>&1 | Out-Null
+    Invoke-DockerHere rm -f @names 2>&1 | Out-Null
 }
 
 function Clear-CutOff {

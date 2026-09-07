@@ -248,61 +248,86 @@ def discover_webkit(schedule):
 
 
 def webkit_floor(releases):
-    """Drop the WebKit builds Playwright has deleted from its CDN.
+    """Drop the WebKit builds Playwright has deleted, and record what is left.
 
     Playwright prunes old builds, so most of the history it names is no longer
     downloadable - measured, the shelf reaches back about two years, not to 2020.
     Listing a version that cannot be fetched is worse than not listing it: the
     the shelf would offer rows that fail on click.
 
-    Availability is monotonic - everything above the oldest surviving build
-    survives too - so a binary search finds the floor in about six requests
-    instead of one per release. That matters: probing all of them gets the CDN to
-    start refusing connections, which reads as "nothing is available".
+    Two passes, because they answer different questions and only the first can be
+    done cheaply. Where the shelf ends is monotonic - Playwright deletes from the
+    old end - so a binary search finds it in about six probes rather than one per
+    release. Which Ubuntu releases a surviving revision was built for is not
+    monotonic and not a rule of any kind: r1908 exists only for focal in the
+    middle of the jammy range, r1668 and r1715 exist for nothing at all. That one
+    has to be asked per revision, and it is what stops the shelf offering a
+    container that cannot be built.
     """
     if not releases:
         return releases
-    if not webkit_available(releases[-1]):
+    if not webkit_bases(releases[-1]):
         return []                          # even the newest is gone; say nothing
 
     low, high = 0, len(releases) - 1       # low unknown, high known-good
     while low < high:
         middle = (low + high) // 2
-        if webkit_available(releases[middle]):
+        if webkit_bases(releases[middle]):
             high = middle
         else:
             low = middle + 1
-    return releases[low:]
+
+    alive = releases[low:]
+    # Three requests each over fifty-odd rows. Concurrent because serial it is a
+    # four-minute pause in a command people run by hand, and capped at six
+    # because this CDN starts refusing connections well before that becomes the
+    # bottleneck - and a refused connection here reads as "no build exists".
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for release, bases in zip(alive, pool.map(webkit_bases, alive)):
+            release["bases"] = list(bases)
+    unbuildable = [r["id"] for r in alive if not r["bases"]]
+    if unbuildable:
+        print("webkit: no Linux build published for r%s - container route off"
+              % ", r".join(unbuildable), file=sys.stderr)
+    return alive
 
 
-def webkit_available(release):
-    """Is this build still on the CDN?
+# Ascending, which is the order they are written to the catalog. Which of them a
+# build prefers is the launcher's business, not the catalog's - see WEBKIT_BASES
+# in engineshelf-docker.sh.
+WEBKIT_UBUNTU = ("20.04", "22.04", "24.04")
 
-    Pruning is per revision, not per platform: Playwright removes the whole
-    directory, so one platform answering 200 proves the build is alive and there
-    is no need to enumerate the rest. The mac archives are named after the macOS
-    version they were built against and so change every year, but the Ubuntu ones
-    have kept the same names throughout - which makes them the cheap probe.
+
+def webkit_bases(release):
+    """Which Ubuntu releases this revision was published for, in order.
+
+    Pruning is per platform, not per revision. That was written here as the
+    opposite - "Playwright removes the whole directory, so one platform answering
+    200 proves the build is alive" - and one probe per revision was all this ever
+    did. Measured against the CDN, r1908 answers for 20.04 and 404s for 22.04,
+    which is a build the shelf offered and no rule here could have placed.
 
     The names carry no arch suffix for x86_64: it is webkit-ubuntu-22.04.zip, not
     -x64. The obvious spelling answers 400 for every revision, which would have
     made every build look pruned.
     """
-    for name in ("ubuntu-22.04", "ubuntu-20.04"):
-        url = WEBKIT_CDN % (release["id"], name)
+    found = []
+    for name in WEBKIT_UBUNTU:
+        url = WEBKIT_CDN % (release["id"], "ubuntu-" + name)
         request = urllib.request.Request(url, method="HEAD")
         try:
             with urllib.request.urlopen(request, timeout=25) as answer:
                 if answer.status == 200:
-                    return True
+                    found.append(name)
         except urllib.error.HTTPError:
             continue
         except (urllib.error.URLError, OSError):
             # A refused connection is not a missing file. Treating it as one
             # would quietly empty the shelf, which is the failure that looks
-            # most like success.
-            return True
-    return False
+            # most like success - so the whole set is claimed and the next run
+            # corrects it.
+            return list(WEBKIT_UBUNTU)
+    return found
 
 
 DISCOVER = {
@@ -315,6 +340,34 @@ DISCOVER = {
 
 CATALOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "catalog.tsv")
+
+
+SHELF_HEADER = (
+    "# Shelf rows - generated by tools/discover.py, do not hand-edit.",
+    "# S<TAB>engine<TAB>year<TAB>id<TAB>label<TAB>date[<TAB>bases]",
+)
+
+
+def shelf_row(engine, release):
+    """One S row.
+
+    Six fields for three engines and a seventh for WebKit, which is the only one
+    whose container cannot always be built: it holds the Ubuntu releases this
+    revision was published for, comma-separated, or "-" when it was published for
+    none. Both managers read it to decide whether the row has a Docker route at
+    all, so a row that says "-" is greyed out rather than offering a build that
+    fails a minute in.
+
+    Absent, not empty, when nothing asked - a catalog written before this field
+    existed, or a run where the CDN would not answer. The managers take a missing
+    field as "no opinion" and behave exactly as they did before it existed, which
+    is what keeps an old catalog working rather than emptying the WebKit shelf.
+    """
+    row = "S\t%s\t%d\t%s\t%s\t%s" % (engine, release["year"], release["id"],
+                                     release["label"], release["date"])
+    if "bases" in release:
+        row += "\t" + (",".join(release["bases"]) or "-")
+    return row
 
 
 def write_catalog(shelves, first_year, failed):
@@ -335,6 +388,12 @@ def write_catalog(shelves, first_year, failed):
                 if parts[0] == "S" and len(parts) > 1 and parts[1] in reachable:
                     replaced.add(parts[1])
                     continue
+                # The two lines below are written fresh at the end of this
+                # function, so keeping the old copy appends a second one on every
+                # run - which it had already done once before anybody noticed,
+                # the S block being long enough that nobody scrolls past it.
+                if row.startswith(SHELF_HEADER[0][:20]) or row.startswith("# S<TAB>"):
+                    continue
                 kept.append(row)
     while kept and not kept[-1].strip():
         kept.pop()
@@ -346,14 +405,11 @@ def write_catalog(shelves, first_year, failed):
         for release in sorted(shelves[engine], key=lambda r: r["sort"]):
             if release["year"] < first_year:
                 continue
-            rows.append("S\t%s\t%d\t%s\t%s\t%s"
-                        % (engine, release["year"], release["id"],
-                           release["label"], release["date"]))
+            rows.append(shelf_row(engine, release))
 
     with open(CATALOG, "w") as handle:
         handle.write("\n".join(kept) + "\n")
-        handle.write("# Shelf rows - generated by tools/discover.py, do not hand-edit.\n")
-        handle.write("# S<TAB>engine<TAB>year<TAB>id<TAB>label<TAB>date\n")
+        handle.write("".join(line + "\n" for line in SHELF_HEADER))
         handle.write("\n".join(rows) + "\n")
 
     print("wrote %d shelf rows for %s" % (len(rows), ", ".join(sorted(reachable))))
@@ -403,9 +459,7 @@ def main():
             for release in sorted(shelves[engine], key=lambda r: r["sort"]):
                 if release["year"] < args.first_year:
                     continue
-                print("S\t%s\t%d\t%s\t%s\t%s"
-                      % (engine, release["year"], release["id"],
-                         release["label"], release["date"]))
+                print(shelf_row(engine, release))
         return 0 if len(failed) < len(ENGINES) else 1
 
     head = "%-6s" % "" + "".join("%-16s" % e.capitalize() for e in ENGINES)

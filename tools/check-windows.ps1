@@ -16,6 +16,8 @@
 #   routes   every endpoint, and the answers the page reads off them
 #   caches   what a state poll costs, and what a finished job invalidates
 #   cli      the download meter, and the refresh that asks the vendors
+#   preflight the WSL 2 -> Docker chain, every state a machine can be in
+#   webkit   which Ubuntu image a container is built from, per revision
 #
 [CmdletBinding()]
 param(
@@ -27,7 +29,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$suites = @('streams', 'routes', 'caches', 'cli')
+$suites = @('streams', 'routes', 'caches', 'cli', 'preflight', 'webkit')
 $failed = @()
 
 # First, and cheapest: a name nothing assigns is $null here rather than an error,

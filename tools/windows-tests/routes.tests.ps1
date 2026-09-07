@@ -9,7 +9,7 @@
 #
 $ErrorActionPreference = 'Stop'
 
-$LiftFrom = './gui/server.ps1'
+$LiftFrom = @('./gui/server.ps1', './lib/preflight.ps1')
 $LiftFunctions = @(
     'Invoke-Route', 'Get-State', 'Get-Body', 'Get-Field', 'Read-JobFile',
     'Get-StreamKey', 'Get-StreamLabel', 'Resolve-Stream', 'Get-StreamUpdated',
@@ -17,13 +17,15 @@ $LiftFunctions = @(
     'Split-JobText', 'Test-MeterLine', 'Get-JobLines', 'Get-StreamJobs',
     'Get-StreamRunning', 'Get-StreamLatest', 'Get-StreamLog', 'Get-StreamList',
     'Get-JobRecord', 'Clear-SizeCache', 'Clear-DoctorCache', 'Get-DirSize',
-    'Test-NativeStale', 'Start-NativeRefresh'
+    'Test-NativeStale', 'Start-NativeRefresh', 'Quote-Args',
+    'Clear-DockerRoute', 'Get-DockerRoute'
 )
 $LiftInspect = @('Start-Job2')
 $LiftVariables = @(
     'StreamLines', 'StreamMax', 'StreamRule', 'StreamDot', 'StreamPattern',
     'Streams', 'SizeCache', 'SizeTtlSeconds', 'DoctorCache', 'DockerCache',
-    'VolumeCache', 'NativeTtl', 'NativeRetrySeconds', 'NativeAsked'
+    'VolumeCache', 'NativeTtl', 'NativeRetrySeconds', 'NativeAsked',
+    'PfDockerRoute'
 )
 . "$PSScriptRoot/harness.ps1"
 
@@ -72,6 +74,8 @@ function Raise-Window { param($job) return $null }
 function Start-Process { $script:spawned += ((@($args) | ForEach-Object { $_ }) -join ' ') }
 
 $script:nativeRecord = $null
+
+
 $script:spawned = @()
 
 # Same parameter list as the real Start-Job2 - checked below, because a stub that

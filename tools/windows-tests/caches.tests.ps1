@@ -5,20 +5,23 @@
 #
 $ErrorActionPreference = 'Stop'
 
-$LiftFrom = './gui/server.ps1'
+$LiftFrom = @('./gui/server.ps1', './lib/preflight.ps1')
 $LiftFunctions = @(
     'Get-DirSize', 'Clear-SizeCache', 'Get-DoctorReport', 'Clear-DoctorCache',
     'Get-JobState', 'Get-JobBrief', 'Test-NativeStale', 'Start-NativeRefresh',
-    'Test-MeterLine', 'Split-JobText', 'Get-JobLines', 'Read-JobFile'
+    'Test-MeterLine', 'Split-JobText', 'Get-JobLines', 'Read-JobFile',
+    'Quote-Args', 'Clear-DockerRoute', 'Get-DockerRoute'
 )
 $LiftVariables = @(
     'SizeCache', 'SizeTtlSeconds', 'DoctorCache', 'DoctorTtlSeconds',
     'DockerCache', 'VolumeCache', 'NativeTtl', 'NativeRetrySeconds',
-    'NativeAsked', 'StreamRule', 'StreamDot'
+    'NativeAsked', 'StreamRule', 'StreamDot', 'PfDockerRoute'
 )
 . "$PSScriptRoot/harness.ps1"
 
 $script:Cli = 'engineshelf.ps1'
+
+
 $script:pfCalls = 0
 $script:pfThrows = $false
 function Get-PfReport {
@@ -88,6 +91,7 @@ $null = Get-DirSize $tree                     # warm
 $null = Get-DoctorReport
 $script:DockerCache = @{ At = (Get-Date); Value = 'held' }
 $script:VolumeCache = @{ At = (Get-Date); Value = 'held' }
+$script:PfDockerRoute = 'windows'
 Test-That 'still running, nothing dropped' (Get-JobState $job).status 'running'
 Test-That 'docker answer still held' $script:DockerCache.Value 'held'
 
@@ -97,6 +101,7 @@ Test-That 'reads as finished' (Get-JobState $job).status 'done'
 Test-That 'docker answer dropped' $script:DockerCache.Value $null
 Test-That 'volume answer dropped' $script:VolumeCache.Value $null
 Test-That 'doctor answer dropped' $script:DoctorCache.Value $null
+Test-That 'and where docker lives is asked again' $script:PfDockerRoute $null
 [IO.File]::WriteAllBytes((Join-Path $tree 'c.bin'), (New-Object byte[] 200))
 Test-That 'sizes measured afresh' (Get-DirSize $tree) 1700
 

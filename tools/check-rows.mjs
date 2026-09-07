@@ -119,6 +119,24 @@ shelf({ os: 'windows', dockerCli: true });
 show('windows: Edge, Docker there', 'Get in Docker',
      offer(release({ nativeAvailable: false })));
 
+// A WebKit revision Playwright published for no Ubuntu release: both managers
+// send docker: null for it, which is the same shape as an engine with no
+// container at all. r1668 and r1715 are the two, measured. On a mac the native
+// archive may still exist and the row is worth drawing; on Windows, where WebKit
+// is never native, there is nothing behind either mark.
+console.log('');
+console.log('a WebKit revision with no Linux build');
+const noLinux = { engine: 'webkit', id: '1668', label: '15.4',
+                  selector: 'webkit:1668', key: 'webkit-1668', docker: null };
+shelf({ os: 'darwin', dockerCli: true });
+show('mac: native still there, Docker shut', 'Get natively',
+     offer(release(noLinux)));
+show('mac: and it is not offered in Docker', false,
+     release(noLinux).dockerAvailable);
+shelf({ os: 'windows', dockerCli: true });
+show('windows: neither route, so no button', 'nothing, dimmed',
+     offer(release({ ...noLinux, nativeAvailable: false })));
+
 console.log('');
 console.log('why the row says the native route is shut');
 shelf({ os: 'windows' });

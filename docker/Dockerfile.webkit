@@ -11,60 +11,84 @@
 # packages below and does need a libgconf shim that WebKit has no use for.
 # Firefox and Edge have no image: their native downloads work on every platform
 # this tool runs on, so a container would add a gigabyte and buy nothing.
-# Ubuntu 22.04, matching the archive, and this is not a preference. The build is
-# named webkit-ubuntu-22.04.zip because it is linked against that release: on
-# Debian 12 it dies at exec with
+
+# The base and the archive are one decision, not two. A build named
+# webkit-ubuntu-22.04.zip is linked against that release: drop it on Debian 12 and
+# it dies at exec with
 #     libicudata.so.70: cannot open shared object file
-# because Debian 12 carries ICU 72 and nothing in the bundle brings its own ICU.
 # Playwright names these archives by distro precisely because they do not travel.
-FROM --platform=linux/amd64 ubuntu:22.04
+# The same lesson, arriving from the other side: the 20.04 archive in a 22.04
+# image builds cleanly and then dies with "libvpx.so.6: cannot open shared object
+# file", because jammy carries libvpx7.
+#
+# So one knob sets both, and a mismatched pair cannot be expressed. It has to be a
+# knob because which releases a revision was published for is not a rule. It was
+# written here as one - everything below r1724 is focal, everything above is
+# jammy - and measured against the CDN one revision at a time, that is wrong in
+# three separate ways:
+#
+#   r1668, r1715           no Linux build at all, on any release
+#   r1908                  20.04 only, in the middle of the jammy range
+#   r1751, r1944, r1992    22.04 only, where their neighbours have both
+#
+# Which is why the launchers ask the CDN rather than consulting a boundary; see
+# webkit_ubuntu() in engineshelf-docker.sh and Get-WebKitUbuntu in
+# engineshelf-docker.ps1. The catalog carries the same answer as an S-row field,
+# so the page can grey out a row nothing can build before it is pressed.
+ARG UBUNTU=22.04
+FROM --platform=linux/amd64 ubuntu:${UBUNTU}
 
 ARG REVISION=2336
-ARG WEBKIT_PLATFORM=ubuntu-22.04
+# Repeated with its default: an ARG from before FROM is out of scope inside the
+# stage, and re-declaring it bare would leave it empty on a build with no
+# --build-arg.
+ARG UBUNTU=22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:0 \
     SCREEN=1440x900x24 \
     ENGINE=webkit
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates wget unzip \
-    xvfb x11vnc fluxbox novnc websockify \
-    # autocutsel bridges PRIMARY and CLIPBOARD through the cut buffer, the same
-    # way it does in the Chromium image.
-    autocutsel xclip \
-    # WebKit's runtime dependencies: the union of Playwright's own nativeDeps for
-    # ubuntu22.04-x64 across releases, not one snapshot of it. The list moves with
-    # the engine - a 2023 build wants libgtk-3-0 and a 2026 one wants libgtk-4-1 -
-    # and one image has to serve both, so both are installed. They coexist.
-    gstreamer1.0-libav gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-    libatk-bridge2.0-0 libatk1.0-0 libatomic1 libavif13 \
-    libcairo2 libdbus-1-3 libdrm2 libegl1 \
-    libenchant-2-2 libepoxy0 libevdev2 libevent-2.1-7 \
-    libffi7 libfontconfig1 libfreetype6 libgbm1 \
-    libgdk-pixbuf-2.0-0 libgles2 libglib2.0-0 libglx0 \
-    libgstreamer-gl1.0-0 libgstreamer-plugins-base1.0-0 libgstreamer1.0-0 libgtk-3-0 \
-    libgtk-4-1 libgudev-1.0-0 libharfbuzz-icu0 libharfbuzz0b \
-    libhyphen0 libicu70 libjpeg-turbo8 liblcms2-2 \
-    libmanette-0.2-0 libnotify4 libopengl0 libopenjp2-7 \
-    libopus0 libpango-1.0-0 libpng16-16 libproxy1v5 \
-    libsecret-1-0 libsoup-3.0-0 libwayland-client0 libwayland-egl1 \
-    libwayland-server0 libwebpdemux2 libwoff1 libx11-6 \
-    libx264-163 libxcomposite1 libxdamage1 libxkbcommon0 \
-    libxml2 libxslt1.1 \
-    && rm -rf /var/lib/apt/lists/*
+# The desktop, and nothing the browser needs. This layer is the same bytes for
+# every revision on a given base, so it is the one Docker gets to reuse; what the
+# build itself links against is per-revision and comes further down, after the
+# archive that names it.
+RUN set -eu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates wget unzip \
+        xvfb x11vnc fluxbox novnc websockify \
+        autocutsel xclip; \
+    rm -rf /var/lib/apt/lists/*
 
 # Kept in the environment so the container can say which build it is running.
 ENV REVISION=${REVISION}
 
-RUN wget -q -O /tmp/webkit.zip \
-    "https://cdn.playwright.dev/dbazure/download/playwright/builds/webkit/${REVISION}/webkit-${WEBKIT_PLATFORM}.zip" \
-    && mkdir -p /opt/webkit \
-    && unzip -q /tmp/webkit.zip -d /opt/webkit \
-    && rm /tmp/webkit.zip \
-    && chmod +x /opt/webkit/pw_run.sh \
-    && find /opt/webkit -type f -name 'MiniBrowser*' -exec chmod +x {} \; \
-    && test -x /opt/webkit/pw_run.sh
+# The archive for the distro this image is, and no other - see the note above
+# FROM. Not a search: a build that downloads cleanly and then cannot resolve its
+# libraries is worse than one that stops here saying which release is missing.
+RUN set -eu; \
+    url="https://cdn.playwright.dev/dbazure/download/playwright/builds/webkit/${REVISION}/webkit-ubuntu-${UBUNTU}.zip"; \
+    if ! wget -q -O /tmp/webkit.zip "$url"; then \
+        echo "No Ubuntu ${UBUNTU} build of WebKit r${REVISION} is published." >&2; \
+        echo "  $url" >&2; \
+        echo "  Playwright publishes each revision for some releases and not others;" >&2; \
+        echo "  a few - r1668, r1715 - it never published for Linux at all." >&2; \
+        exit 1; \
+    fi; \
+    echo "webkit r${REVISION}: webkit-ubuntu-${UBUNTU}.zip"; \
+    mkdir -p /opt/webkit; \
+    unzip -q /tmp/webkit.zip -d /opt/webkit; \
+    rm /tmp/webkit.zip; \
+    chmod +x /opt/webkit/pw_run.sh; \
+    find /opt/webkit -type f -name 'MiniBrowser*' -exec chmod +x {} \; ; \
+    test -x /opt/webkit/pw_run.sh
+
+# What this particular build links against, read off the build itself rather than
+# written down here. See the file: it also refuses to finish an image whose
+# browser could not start.
+COPY webkit-deps.sh /tmp/webkit-deps.sh
+RUN sh /tmp/webkit-deps.sh && rm /tmp/webkit-deps.sh
 
 COPY clipboard.js /usr/share/novnc/app/clipboard.js
 COPY novnc-clipboard.sh /tmp/novnc-clipboard.sh

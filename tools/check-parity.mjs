@@ -252,6 +252,116 @@ if (leaky.length) {
   ]);
 } else pass('a job is given no stdin', 'both managers');
 
+// ---------- 4c. arguments with spaces in them ----------
+// Python hands subprocess a list, and a list is the argument vector - a path with
+// a space in it is one argument, always. Start-Process joins -ArgumentList with
+// spaces and quotes nothing, so the same path arrives split, and every job on a
+// machine whose download folder holds a second copy - "EngineShelf-1.1.5-Windows
+// (1)" - failed on "the file does not have a '.ps1' extension". Quote-Args is the
+// answer; this is that nobody adds a call site that forgets it.
+const raw = [...PS.matchAll(/-ArgumentList\s+(.{0,20})/g)]
+  .map((m) => m[1].trim())
+  .filter((tail) => !tail.startsWith('(Quote-Args') && !tail.startsWith('('));
+if (raw.length) {
+  fail('every Start-Process quotes its arguments', [
+    ...raw.map((t) => `-ArgumentList ${t}...`),
+    'Wrap it in Quote-Args, from lib/preflight.ps1.',
+  ]);
+} else pass('every Start-Process quotes its arguments', 'server.ps1');
+
+// ---------- 4d. the WebKit base image ----------
+// A WebKit archive only runs on the Ubuntu release it was built for - the focal
+// one in a jammy image links fine and then dies on libvpx.so.6 - and which
+// releases a revision was published for is not a rule: r1908 is focal-only in
+// the middle of the jammy range, r1668 and r1715 exist for neither. This used to
+// be a boundary constant in three files, which was wrong for five of the
+// fifty-three rows. Both launchers now ask the CDN, in the same order, and the
+// order is the only thing left that can disagree.
+const basesSh = DOCK_SH.match(/^WEBKIT_BASES="([^"]+)"/m)?.[1]
+  ?.trim().split(/\s+/).join(',');
+const basesPs = DOCK_PS.match(/^\$WebKitBases = @\(([^)]+)\)/m)?.[1]
+  ?.match(/'([^']+)'/g)?.map((s) => s.slice(1, -1)).join(',');
+if (!basesSh || !basesPs) {
+  fail('both launchers name the WebKit base images', [
+    `engineshelf-docker.sh: ${basesSh ?? 'missing'}`,
+    `engineshelf-docker.ps1: ${basesPs ?? 'missing'}`,
+  ]);
+} else if (basesSh !== basesPs) {
+  fail('both launchers try the WebKit base images in one order', [
+    `shell ${basesSh}, powershell ${basesPs}`,
+    'The first that answers is the image that gets built, so the order is the',
+    'decision - two orders is two different images for the same revision.',
+  ]);
+} else pass('both launchers try the WebKit base images in one order', basesSh);
+
+// Neither launcher may go back to deciding this without asking. A boundary is
+// cheap to reintroduce and reads as an optimisation; it is the exact bug above.
+const guessed = [
+  ['engineshelf-docker.sh', /FOCAL_BELOW|\blt\b\s+"?\$?WEBKIT/i.test(DOCK_SH)],
+  ['engineshelf-docker.ps1', /FocalBelow/i.test(DOCK_PS)],
+].filter(([, hit]) => hit).map(([name]) => name);
+if (guessed.length) {
+  fail('no launcher guesses the WebKit base from the revision number', [
+    ...guessed,
+    'Availability is per revision and per release; ask the CDN.',
+  ]);
+} else pass('no launcher guesses the WebKit base from the revision number', 'both ask');
+
+// And the image reads its own dependencies rather than carrying a list. Two
+// hand-written lists lived in the Dockerfile, one per base; the focal one was
+// measured against r1446 and shipped for thirteen more revisions, every one of
+// which died at exec on a library it did not name. The archive ships the right
+// list for its own revision, so the only correct list here is no list.
+const DOCKERFILE = read('docker/Dockerfile.webkit');
+const runsDeps = /COPY webkit-deps\.sh/.test(DOCKERFILE) &&
+                 /RUN sh \/tmp\/webkit-deps\.sh/.test(DOCKERFILE);
+// A run of library packages on one line is what a reintroduced list looks like.
+const handList = DOCKERFILE.split('\n')
+  .find((line) => (line.match(/\blib[a-z0-9.+-]*\d\b/g) ?? []).length >= 4);
+if (!runsDeps || handList) {
+  fail('the WebKit image reads its dependencies off the archive', [
+    runsDeps ? 'webkit-deps.sh runs' : 'docker/Dockerfile.webkit does not run webkit-deps.sh',
+    ...(handList ? [`a package list is back: ${handList.trim().slice(0, 60)}...`] : []),
+  ]);
+} else {
+  pass('the WebKit image reads its dependencies off the archive', 'webkit-deps.sh');
+}
+
+// The catalog is the page's copy of the same answer, and the field only means
+// anything if both managers read it. A WebKit row whose Docker route is open on
+// one manager and closed on the other is CLAUDE.md's first rule, exactly.
+const basesField = [
+  ['gui/server.py', /"bases": parts\[6\]/.test(PY),
+   /release\.get\("bases"\) == "-"/.test(PY)],
+  ['gui/server.ps1', /\$bases = \$f\[6\]|\$bases = \$f\[6\]|bases = \$bases/.test(PS),
+   /\$release\.bases -eq '-'/.test(PS)],
+];
+const gaps = basesField
+  .filter(([, reads, acts]) => !reads || !acts)
+  .map(([name, reads]) => `${name}: ${reads ? 'reads it, ignores it' : 'does not read it'}`);
+if (gaps.length) {
+  fail('both managers close the Docker route on a WebKit row with no Linux build', gaps);
+} else {
+  pass('both managers close the Docker route on a WebKit row with no Linux build',
+       'catalog field 7');
+}
+
+// And the field has to be there to be read. Written by tools/discover.py, one
+// entry per WebKit row; "-" is the answer that closes the route.
+const shelfWebkit = read('catalog.tsv').split('\n')
+  .filter((line) => line.startsWith('S\twebkit\t'));
+const unfielded = shelfWebkit.filter((line) => line.split('\t').length < 7);
+if (!shelfWebkit.length || unfielded.length) {
+  fail('every WebKit shelf row says which Ubuntu releases it was built for', [
+    `${unfielded.length} of ${shelfWebkit.length} rows carry no seventh field`,
+    'Regenerate with: python3 tools/discover.py --write',
+  ]);
+} else {
+  const closed = shelfWebkit.filter((line) => line.split('\t')[6] === '-').length;
+  pass('every WebKit shelf row says which Ubuntu releases it was built for',
+       `${shelfWebkit.length} rows, ${closed} with no Linux build`);
+}
+
 // ---------- 5. native and Docker offer the same shelf ----------
 // Chain per verb: the page sends it, both managers allow it, both launchers
 // implement it. A break anywhere is a menu entry that answers 400 or a job that
