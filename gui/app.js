@@ -258,7 +258,13 @@ const WORK_WORD = {
    and they are the same act on the two routes. Stopping is excluded for a second
    reason - interrupting `docker stop` leaves the browser inside holding the lock
    in its profile volume, which is what made a version permanently unstartable. */
-const CANCELLABLE = new Set(['install', 'launch', 'docker']);
+// 'doctor' is in here for a different reason than the rest. A dependency install
+// is somebody else's installer - winget, brew, the Docker convenience script -
+// and however carefully it is invoked, the day it stops and waits for something
+// is the day this job runs until the manager is quit. The others are cancellable
+// because calling them off costs nothing; this one is cancellable because there
+// has to be a way out of it.
+const CANCELLABLE = new Set(['install', 'launch', 'docker', 'doctor']);
 const DOCKER_FINAL = new Set(['stop', 'clean', 'purge']);
 
 const cancellable = (job) =>
@@ -500,6 +506,18 @@ function curlBytes(text) {
   );
 }
 
+// The Windows CLI has no curl in the picture, so it draws its own meter - see
+// Write-Meter in engineshelf.ps1, which is the other half of this:
+//
+//   "  100 MB / 232 MB · 16s left · 12 MB/s  43%"
+//
+// The bytes and the estimate are already worded the way this file words a curl
+// meter, so they are lifted straight out and a row reads the same whichever
+// platform is behind it. The percentage is last on the line, which is also what
+// makes the bare-percentage fallback below catch it if this ever stops matching.
+const OWN_METER =
+  /^\s*(\d[\d.]* [KMGT]?B \/ \d[\d.]* [KMGT]?B)(?: · ((?:\d+[hms] )+left))?.*?(\d{1,3})%\s*$/;
+
 // "0:00:11" -> "11s left". A dashed clock means curl has nothing to estimate from.
 function curlLeft(text) {
   const found = String(text).match(/^(\d+):(\d\d):(\d\d)$/);
@@ -565,6 +583,12 @@ function readJob(output) {
         ]
           .filter(Boolean)
           .join(' · ') || null;
+      return info;
+    }
+    const own = frames[index].match(OWN_METER);
+    if (own) {
+      info.percent = Math.min(100, Number(own[3]));
+      info.detail = [own[1], own[2]].filter(Boolean).join(' · ') || null;
       return info;
     }
     // A terminal-style bar - an older CLI, or an install run by hand - still
@@ -1060,6 +1084,18 @@ function nativeRoute(row) {
     return ['off', 'Native: no build of this version exists for this machine.'];
   }
   if (row.nativeGone && !row.installed) {
+    // Edge on Windows is not the same answer as Edge on a mac, and saying the
+    // feed has nothing left is untrue there: it serves current Windows Edge, as
+    // an installer. Nothing is missing and nothing will change - which is worth
+    // saying plainly, because the mac wording reads as "wait for the vendor".
+    if (row.engine === 'edge' && state && state.os === 'windows') {
+      return [
+        'off',
+        'Native: not on Windows. Microsoft ships Edge here as an installer ' +
+          'rather than an archive, so there is nothing to put on the shelf. The ' +
+          'container runs the Linux build instead.',
+      ];
+    }
     return [
       'off',
       row.engine === 'edge'
@@ -1772,6 +1808,26 @@ function renderGroup(group) {
   return section;
 }
 
+// Both ways of running this version are closed, so the row has no button worth
+// drawing - the same state a version with no build for this machine has always
+// been in, reached by the other road.
+//
+// Its own function because it is the rule "a row never offers a dead end", and
+// tools/check-rows.mjs pins it. Written inline, it had covered only the catalog's
+// half: a vendor that has stopped serving a version leaves exactly as little to
+// download as a version that never had a build here, and `dockerOnly` is false on
+// a machine with no Docker - so the cascade fell through to the plain native Get,
+// on a row whose own tooltip said there was nothing left to download. Every Edge
+// row on Windows sits in that state, and so does an aged-out Edge or WebKit on a
+// mac.
+//
+// Installed is not in it: a build already on disk still launches after the vendor
+// has forgotten it, which is half the point of the shelf.
+function nothingToOffer(row) {
+  const nowhereNative = !row.supported || (row.nativeGone && !row.installed);
+  return nowhereNative && !row.dockerOnly && !row.dockerImage && !row.installed;
+}
+
 function renderRow(row) {
   const node = $('row-template').content.firstElementChild.cloneNode(true);
 
@@ -1942,7 +1998,7 @@ function renderRow(row) {
   // with no build for this machine still runs in a container, so it keeps its
   // buttons - it was the greyed-out rows with no way to open them that made the
   // whole shelf look shorter than it is.
-  if (!row.supported && !row.dockerOnly) {
+  if (nothingToOffer(row)) {
     node.classList.add('unsupported');
   } else {
     if (!row.supported) node.classList.add('docker-only');
@@ -3041,9 +3097,11 @@ function noteJob(job, output) {
    page reads the list off the state document, and closing a tab hides it here
    rather than throwing anything away. */
 
-// key -> {key, label, lines: [], total, job, jobs, updated, local, status}
+// key -> {key, label, lines: [], total, gen, job, jobs, updated, local, status}
 //   lines  what this window holds of the stream, as text
 //   total  the absolute line number after the last one it holds
+//   gen    bumped whenever `lines` is thrown away rather than appended to, which
+//          is what tells the panel it cannot simply draw the new tail
 //   jobs   everything still running on it, which can be more than one
 const logStreams = new Map();
 let watchKey = null; // stream shown in the panel
@@ -3193,6 +3251,7 @@ function makeStream(key, label) {
     label: label || key,
     lines: [],
     total: 0,
+    gen: 0,
     job: null,
     jobs: [],
     updated: 0,
@@ -3802,6 +3861,7 @@ async function pumpLog() {
       'output. The version list still updates, and the launcher writes its own log',
       'under the EngineShelf home directory.',
     ];
+    stream.gen++;
     renderLog();
     return;
   }
@@ -3811,7 +3871,10 @@ async function pumpLog() {
 
   // `first` above what was asked for means the buffer wrapped past it, so what
   // is held here no longer joins onto what came back.
-  if (answer.first > stream.total) stream.lines = [];
+  if (answer.first > stream.total) {
+    stream.lines = [];
+    stream.gen++;
+  }
   stream.lines.push(...asArray(answer.lines));
   stream.total = answer.total;
   stream.label = answer.label || stream.label;
@@ -3987,12 +4050,143 @@ function stopButton(glyph, title, disabled, handler) {
   return button;
 }
 
+/* ---------- what a line is ----------
+   A container build is eight minutes of apt output with four lines in it that
+   anyone wanted, and every one of those lines used to be the same grey as the
+   rest of them. So each line is read once on its way into the panel and given
+   the one word that says what it is, and the panel paints that word.
+
+   What it reads is the CLIs' own vocabulary, which is the coupling PHASE_MARKS
+   above already lives with - and both halves of every pair are here, because
+   gui/app.js cannot tell which manager served it. The shell CLI marks a result
+   `v Chromium 120 ready.` and the PowerShell one marks it `OK Chromium 120
+   ready.`; a colour that knew only one of them would be a feature silently
+   missing on the platform its author does not use. tools/check-phases.mjs holds
+   both CLIs to this.
+
+   Deliberately a small vocabulary. Six colours is a legend nobody reads, and a
+   log where everything is highlighted is a log where nothing is. */
+
+// The divider both managers write between two runs on one target:
+// "-- Chromium 120 · 14:22:07 --" in box-drawing rules. server.py writes it
+// literally; server.ps1 builds it from [char]0x2500 because that file stays
+// ASCII. Matching it here is what puts a visible seam between two runs.
+const LOG_RULE = /^── .+ ──$/;
+
+// BuildKit stamps its step number on everything a `docker build` prints, and a
+// timestamp too on output from the command running inside the step:
+//     #12 [4/9] RUN apt-get install -y libvpx6
+//     #12 12.34 E: Unable to locate package libvpx6
+// Stripped before the line is read, so apt's own markers are found where they
+// really are rather than in the middle of what looks like a sentence.
+const LOG_BUILD_STEP = /^#\d+ (?:\d+(?:\.\d+)? )?/;
+const LOG_BUILD_HEAD = /^\[\d+\/\d+\] /;
+
+// The symbol each CLI puts in front of a result. Two spaces from engineshelf.sh
+// and engineshelf.ps1 ("x  Unsupported OS"), one from lib/preflight.sh, which
+// indents its own ("  ok Docker is ready."). preflight.ps1 colours that last one
+// green instead of marking it, so on Windows it arrives unmarked - the "ready."
+// phase mark below is what catches it, and why that one is worth keeping.
+const MARK_BAD = /^ {0,3}[xX] {1,2}(?=\S)/;
+const MARK_WARN = /^ {0,3}! {1,2}(?=\S)/;
+const MARK_OK = /^ {0,3}(?:v|ok|OK) {1,2}(?=\S)/;
+
+// Nothing here prefixed these: they come from whatever EngineShelf shelled out
+// to - apt inside a container build, docker itself, a child that died - and
+// they are the lines somebody opens this panel to find.
+const LOG_BAD_WORDS =
+  /^E: |^Traceback \(most recent call last\)|\bERROR\b|\b(?:error|fatal):|\bdid not complete successfully\b|\bcommand not found\b|\bNo such file or directory\b|\bPermission denied\b/;
+const LOG_WARN_WORDS = /^W: |\bWARNING\b|\bwarning:/;
+
+// "  > Chromium 120 (Mac_Arm)", "  > http://localhost:6080/vnc.html" - the line
+// that says the thing is up, and the address it is up at.
+const LOG_UP = /^ {0,4}> /;
+
+// curl's own header, above the twelve columns meterFrom reads.
+const LOG_METER_HEAD = /^\s*% Total\s/;
+
+// The asides each CLI prints dim: where the build landed, where its profile is,
+// what to type next. Not what anyone opened the panel for.
+const LOG_ASIDE = /^\s*(?:->|Profile:|Log:|Stop it with:|This will run:)/;
+
+// Which colour a phase belongs to, so the four marks the page already reads for
+// progress do not get a second set of patterns written against them.
+const PHASE_KIND = {
+  downloading: 'step',
+  extracting: 'step',
+  ready: 'ok',
+  open: 'up',
+};
+
+function logKind(text) {
+  const line = text.replace(/\s+$/, '');
+  if (!line) return '';
+  if (LOG_RULE.test(line)) return 'rule';
+
+  const build = LOG_BUILD_STEP.test(line);
+  const body = build ? line.replace(LOG_BUILD_STEP, '') : line;
+
+  if (MARK_BAD.test(body) || LOG_BAD_WORDS.test(body)) return 'bad';
+  if (MARK_WARN.test(body) || LOG_WARN_WORDS.test(body)) return 'warn';
+  if (MARK_OK.test(body)) return 'ok';
+
+  // Inside a build, the step's own heading is where somebody scrolling stops.
+  // Everything printed underneath it is noise until something goes wrong in it,
+  // and the two lines above have already caught that.
+  if (build) return LOG_BUILD_HEAD.test(body) ? 'step' : 'quiet';
+
+  for (const [pattern, name] of PHASE_MARKS) {
+    if (pattern.test(line)) return PHASE_KIND[name];
+  }
+  if (LOG_UP.test(line)) return 'up';
+  if (LOG_METER_HEAD.test(line) || meterFrom(line) || OWN_METER.test(line))
+    return 'quiet';
+  if (LOG_ASIDE.test(line)) return 'quiet';
+  return '';
+}
+
+// A URL is the one thing in a log somebody means to copy out of it - the noVNC
+// address a container prints, the download it is pulling from - so it is lifted
+// out of whatever line it is on rather than left the colour of that line.
+const LOG_URL = /(https?:\/\/[^\s'"<>]+)/;
+
+function logLineNode(text) {
+  const kind = logKind(text);
+  const node = document.createElement('span');
+  node.className = kind ? `log-ln is-${kind}` : 'log-ln';
+  // Odd indices are the capture group, which is the URL itself.
+  const parts = text.split(LOG_URL);
+  if (parts.length === 1) {
+    node.textContent = text;
+    return node;
+  }
+  parts.forEach((part, index) => {
+    if (!part) return;
+    if (index % 2 === 0) {
+      node.append(part);
+      return;
+    }
+    const url = document.createElement('span');
+    url.className = 'log-url';
+    url.textContent = part;
+    node.append(url);
+  });
+  return node;
+}
+
+// What the panel is holding, so the usual repaint appends the handful of lines
+// that arrived rather than rebuilding fifteen hundred of them four times a
+// second - and so a selection somebody made halfway up the log survives the
+// next poll, which it never did while this was one assignment to textContent.
+let logDrawn = { key: null, gen: -1, count: 0 };
+
 function renderLog() {
   const stream = watchKey ? logStreams.get(watchKey) : null;
   const out = $('log-out');
   const atBottom = out.scrollTop + out.clientHeight >= out.scrollHeight - 20;
 
   if (!stream) {
+    logDrawn = { key: null, gen: -1, count: 0 };
     out.textContent = managerLogs
       ? ''
       : 'The manager answering this page was started before the page was updated, ' +
@@ -4000,10 +4194,24 @@ function renderLog() {
         'Quit EngineShelf and open it again. Nothing is lost that was not already\n' +
         'gone: the output of a job lives in the process that ran it.';
   } else {
-    // curl draws its progress bar with carriage returns; keep only the last frame.
-    out.textContent = stream.lines
-      .map((line) => line.split('\r').pop())
-      .join('\n');
+    // Lines only ever arrive on the end of a stream: the manager collapses a
+    // redrawn meter into a line this window has already been sent, and a window
+    // never asks for a line twice. `gen` is what says otherwise - it moves when
+    // pumpLog throws the buffer away, which is what a manager-side wrap does.
+    const grew =
+      logDrawn.key === stream.key &&
+      logDrawn.gen === stream.gen &&
+      logDrawn.count <= stream.lines.length;
+    if (!grew) out.textContent = '';
+
+    const block = document.createDocumentFragment();
+    for (let index = grew ? logDrawn.count : 0; index < stream.lines.length; index++) {
+      // curl draws its progress bar with carriage returns; keep the last frame.
+      block.append(logLineNode(stream.lines[index].split('\r').pop()));
+    }
+    out.append(block);
+    logDrawn = { key: stream.key, gen: stream.gen, count: stream.lines.length };
+
     if (atBottom) out.scrollTop = out.scrollHeight;
   }
   renderLogHead();
@@ -4020,6 +4228,7 @@ function showJobFailure(title, message) {
   stream.job = null;
   stream.status = 'failed';
   stream.lines = String(message).split('\n');
+  stream.gen++;
   delete hidden[key];
   toFront(key);
   watchKey = key;

@@ -567,7 +567,7 @@ question, and only the vendor can answer it:
 | Engine | Measured here | Why |
 |---|---|---|
 | **Edge** | 34 of 39 shelf rows cannot be fetched on macOS | the enterprise feed is the only source for a mac or Windows Edge and keeps about six months. On **Windows** it is all of them: Microsoft ships only an MSI, whose payload is an installer stream rather than an archive |
-| **WebKit** | 36 of 53 cannot be fetched | Playwright deletes the older macOS archives — the boundary here is r2051 (18.0) — and keeps the Linux ones |
+| **WebKit** | 36 of 53 cannot be fetched natively; 2 of 53 have no container either | Playwright deletes the older macOS archives — the boundary here is r2051 (18.0). The Linux side is pruned per Ubuntu release rather than per revision, and r1668 and r1715 were published for none of them |
 | **Chromium** | 34 of 34 catalogued revisions still live | the snapshot archive keeps them, and an uncatalogued milestone is resolved against it on demand |
 | **Firefox** | none missing | `ftp.mozilla.org` has kept every release Mozilla ever shipped |
 
@@ -579,6 +579,14 @@ find out. The shelf now asks first, in the background, and never on the page's o
   middle, so halving the shelf finds the boundary. Cached for three days
 - both answers land in `~/.engineshelf/native.json`, and a row with no answer yet behaves exactly
   as it did before any of this — an unasked question is not a no
+
+The container route is asked the same question, but at a different time. Which Ubuntu releases a
+WebKit revision was published for is not a rule — r1908 exists only for 20.04 in the middle of the
+22.04 range, and r1668 and r1715 exist for neither — so the answer is measured per revision by
+`tools/discover.py` and shipped in `catalog.tsv`. Two rows carry no Linux build at all, and their
+cube is grey: on a mac they still download natively, on Windows there is nothing behind either
+mark and the row draws no button. The launcher asks the CDN again when it builds, so a container
+is never built on a base that has no archive.
 
 A row the vendor has dropped keeps its place on the shelf and **loses every native option**: no
 Get, no *Download only*, no *Download and launch natively*. Its native mark goes grey

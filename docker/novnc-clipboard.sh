@@ -39,4 +39,11 @@ grep -q 'app/clipboard.js' "$page"
 # how a rebuilt image ends up running a new ui.js against a cached core/. The
 # no-store header in novnc-serve.py is the real fix; this makes the tree
 # consistent for anything that reaches it another way.
-find /usr/share/novnc -exec touch {} +
+#
+# -h so the symlink itself is stamped rather than whatever it points at. Ubuntu
+# 20.04's noVNC ships include/web-socket-js-project/swfobject.js as a link to a
+# file its package no longer carries, and following that dangling link is a
+# non-zero exit - which, with `set -e` at the top, failed the whole build on the
+# older base. Stamping links rather than targets is also the more correct thing
+# here: every real file under this tree is enumerated by find in its own right.
+find /usr/share/novnc -exec touch -h {} +

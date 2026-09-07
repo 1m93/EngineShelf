@@ -109,8 +109,11 @@ Which version? A bare number is Chromium: 74. Otherwise name the engine:
   esac
   engine="$(printf '%s' "$engine" | tr '[:upper:]' '[:lower:]')"
   # Only Firefox and Edge are handed a resolved download; this runs under
-  # `set -u`, so it has to exist for the other two as well.
+  # `set -u`, so it has to exist for the other two as well. Same for the Ubuntu
+  # release a WebKit image is built on, which build_image fills in and only for
+  # WebKit.
   DOCKER_URL=""
+  WEBKIT_UBUNTU=""
 
   case "$engine" in
     chromium) ;;
@@ -244,10 +247,46 @@ engine_label() {
 
 # What each Dockerfile needs told. Chromium and WebKit are addressed by revision
 # and build their own URL; the other two are handed the one already resolved.
+# Which Ubuntu release a WebKit revision was published for. The base and the
+# archive have to match - the focal archive in a jammy image dies at launch on
+# libvpx.so.6 - so this decides both, and getting it wrong is a container that
+# builds and then cannot start.
+#
+# It was written as a boundary: below r1724 focal, at or above it jammy. Measured
+# against the CDN one revision at a time, availability is not a boundary and is
+# not even monotonic - r1908 exists only for focal, in the middle of the jammy
+# range; r1751, r1944 and r1992 only for jammy, where their neighbours have both;
+# r1668 and r1715 for nothing at all. Any rule short of asking is wrong for some
+# row, and the ones it is wrong for are the ones nobody thinks to test.
+#
+# So it asks. Three requests against a CDN, on a path that is about to download
+# a hundred megabytes from the same CDN. Preference order rather than newest
+# first: 22.04 and 20.04 are the two releases this image has been built and run
+# against, and 24.04 is a fallback for a revision published for nothing else.
+# Keep it in step with $WebKitBases in engineshelf-docker.ps1 -
+# tools/check-parity.mjs holds the two to each other.
+WEBKIT_BASES="22.04 20.04 24.04"
+
+webkit_ubuntu() {
+  local revision="$1" release
+  # A non-numeric token never reaches this in practice - resolve_webkit_docker
+  # turns a label into a revision first - but the Dockerfile's own default is the
+  # honest answer if one ever does.
+  case "$revision" in ''|*[!0-9]*) printf '22.04\n'; return 0 ;; esac
+  for release in $WEBKIT_BASES; do
+    if net_exists "$WEBKIT_CDN/$revision/webkit-ubuntu-$release.zip"; then
+      printf '%s\n' "$release"
+      return 0
+    fi
+  done
+  return 1
+}
+
 engine_build_args() {
   case "$1" in
     firefox) printf '%s\n' "FIREFOX_URL=$DOCKER_URL" "FIREFOX_VERSION=$DOCKER_VERSION" ;;
     edge)    printf '%s\n' "EDGE_URL=$DOCKER_URL" "EDGE_VERSION=$DOCKER_VERSION" ;;
+    webkit)  printf '%s\n' "REVISION=$DOCKER_ID" "UBUNTU=$WEBKIT_UBUNTU" ;;
     *)       printf '%s\n' "REVISION=$DOCKER_ID" ;;
   esac
 }
@@ -258,6 +297,17 @@ engine_build_args() {
 build_image() {
   local image="$1"; shift
   local args=() line
+  # Asked here rather than at resolve time, so `stop` and `status` stay offline.
+  # Plain assignment on purpose: `local x="$(...)"` would swallow the status and
+  # build a jammy image for a revision that has no jammy archive.
+  if [ "$DOCKER_ENGINE" = "webkit" ]; then
+    WEBKIT_UBUNTU="$(webkit_ubuntu "$DOCKER_ID")" || die "\
+Playwright published no Linux build of WebKit r$DOCKER_ID.
+   Tried ubuntu-$(printf '%s' "$WEBKIT_BASES" | tr ' ' ',' | sed 's/,/, ubuntu-/g').
+   Every revision is published for some releases and not others, and r1668 and
+   r1715 were published for none - there is nothing to put in a container. The
+   native launcher is unaffected where it has a build for this machine."
+  fi
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     args+=(--build-arg "$line")

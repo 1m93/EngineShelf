@@ -14,13 +14,155 @@
 
 function Test-Have { param([string]$Name) $null -ne (Get-Command $Name -ErrorAction SilentlyContinue) }
 
+# ---------- the Docker edition on Windows ----------
+# Windows has no colima, and Docker Desktop is the thing this tool has always
+# refused: over a gigabyte, admin rights, a reboot, and a licence that is only
+# free for small companies. What is left is the same Linux machine everyone else
+# already has - WSL 2 - with Docker Engine inside it, driven with `wsl -u root`,
+# which needs no password because root inside the distro is not root out here.
+#
+# So the chain is four links, and each is its own row in the system check:
+#
+#   virtualisation   firmware. Nothing here can turn it on.
+#   WSL 2            one admin prompt, usually one restart. Windows insists.
+#   Docker Engine    inside the distro. Automatic, and asks nothing.
+#   the daemon       inside the distro. Automatic.
+#
+# Every step only has to move the state on by one; the next check re-reads the
+# machine rather than trusting what just ran. That is what makes the chain
+# survive a restart in the middle of it, and what makes it safe for
+# `wsl --install` to behave differently on different builds of Windows.
+
+# Docker reachable from Windows itself. True when the user chose Docker Desktop,
+# which is theirs to choose - nothing here installs it.
+function Test-WindowsDocker {
+    if (-not (Test-Have docker)) { return $false }
+    docker info 2>&1 | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+# A distro that answers. `wsl -l -q` lists installed ones; the command exists on
+# machines where the feature is not enabled at all, so the list is the question,
+# not the executable.
+function Test-WslReady {
+    if (-not (Test-Have wsl)) { return $false }
+    $found = wsl -l -q 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    return ((@($found) -join '').Trim().Length -gt 0)
+}
+
+# Inside the distro, as root - no sudo, so nothing to answer.
+function Invoke-Wsl {
+    param([string]$Command)
+    $out = wsl -u root -e sh -lc $Command 2>&1
+    return @{ code = $LASTEXITCODE; out = (@($out) -join "`n") }
+}
+
+function Test-WslDocker { return (Invoke-Wsl 'command -v docker >/dev/null 2>&1').code -eq 0 }
+function Test-WslDockerRunning { return (Invoke-Wsl 'docker info >/dev/null 2>&1').code -eq 0 }
+
+# ---------- where docker is, and how to reach it ----------
+# Two answers on Windows and everything downstream has to agree on which: the
+# launcher builds and runs containers, and the manager reads back what exists.
+# One decision, made here, so a machine cannot have the launcher talking to a
+# daemon the shelf is not looking at.
+#
+#   'windows'  docker.exe answers - the user installed Docker Desktop
+#   'wsl'      docker lives inside the distro
+#   ''         neither, and the doctor's chain says what to do about it
+#
+# Deciding costs a `docker info`, so it is remembered. Clear-DockerRoute exists
+# because the manager outlives the answer: somebody can install Docker while it
+# is running, and the same moment that drops the other caches drops this.
+$script:PfDockerRoute = $null
+
+function Clear-DockerRoute { $script:PfDockerRoute = $null }
+
+function Get-DockerRoute {
+    if ($null -ne $script:PfDockerRoute) { return $script:PfDockerRoute }
+    if (Test-WindowsDocker) { $script:PfDockerRoute = 'windows' }
+    elseif ((Test-WslReady) -and (Test-WslDocker)) { $script:PfDockerRoute = 'wsl' }
+    else { $script:PfDockerRoute = '' }
+    return $script:PfDockerRoute
+}
+
+# A Windows path as the distro sees it. Only the build needs this - a Dockerfile
+# and its context are the only host paths any of this hands to docker; volumes
+# are named, not mounted from disk.
+function ConvertTo-WslPath {
+    param([string]$Path)
+    $converted = wsl -u root -e wslpath -u $Path 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $converted) { return $Path }
+    return ("$converted").Trim()
+}
+
+# Run docker, wherever docker is. Same arguments either way.
+#
+# `wsl -e` and not `wsl sh -lc`: -e hands the argument vector straight to the
+# distro, so a --format string full of braces and spaces arrives as one argument
+# instead of being re-split by a shell.
+#
+# The preference dance is not decoration. Windows PowerShell turns a native
+# command's stderr into an error record, and `$ErrorActionPreference = 'Stop'` -
+# which engineshelf-docker.ps1 sets - makes that record terminate the script.
+# Callers have always handled it by redirecting at the call site:
+#
+#     docker rm -f $container 2>&1 | Out-Null
+#
+# because clearing a container that is not there is an ordinary thing to do and
+# "No such container" is an ordinary thing to hear. Moving the native call in
+# here put a function boundary between the two: the record is now raised in this
+# scope, where that redirection does not reach, and a routine `docker rm` ended a
+# perfectly good `start` with a NativeCommandError. So the preference is lowered
+# for exactly the length of the call, which leaves the record non-terminating and
+# every caller's own 2>$null or 2>&1 working as it always did.
+# No param block, deliberately. A single [Parameter()] attribute makes this an
+# advanced function, and an advanced function gets PowerShell's common parameters
+# - which are prefix-matched. `docker run -p 127.0.0.1:6080:6080` then binds -p to
+# -PipelineVariable and dies on
+#
+#     Cannot validate argument '127.0.0.1:6080:6080' because it is not a valid
+#     variable name
+#
+# and -d, -v and -f would have gone the same way against -Debug, -Verbose and
+# -Force. A plain function does no binding at all: everything lands in $args
+# exactly as written, which is the only correct thing for a passthrough.
+function Invoke-DockerHere {
+    $was = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        switch (Get-DockerRoute) {
+            'windows' { & docker @args }
+            'wsl'     { & wsl -u root -e docker @args }
+            default {
+                # Nothing to run it with. Callers check $LASTEXITCODE the way they
+                # do for a docker that answered badly, so this has to look the same.
+                $global:LASTEXITCODE = 127
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $was
+    }
+}
+
 function Get-PfStatus {
     param([string]$Component)
     switch ($Component) {
+        'wsl' {
+            if (-not (Test-Have wsl)) { return 'missing' }
+            # The command is there and no distro is: WSL is half-installed, which
+            # is what a restart-pending machine looks like too.
+            if (-not (Test-WslReady)) { return 'inactive' }
+            return 'ok'
+        }
         'docker' {
-            if (-not (Test-Have docker)) { return 'missing' }
-            docker info 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { return 'ok' } else { return 'inactive' }
+            # Desktop answering is a complete answer; the rest of this is about
+            # the route for people who did not install it.
+            if (Test-WindowsDocker) { return 'ok' }
+            if (-not (Test-WslReady)) { return 'missing' }
+            if (-not (Test-WslDocker)) { return 'missing' }
+            if (Test-WslDockerRunning) { return 'ok' }
+            return 'inactive'
         }
         default { return 'na' }
     }
@@ -34,6 +176,7 @@ function Get-PfLabel {
         'unzip'   { 'unzip' }
         'docker'  { 'Docker' }
         'rosetta' { 'Rosetta 2' }
+        'wsl'     { 'WSL 2' }
     }
 }
 
@@ -41,6 +184,7 @@ function Get-PfNeed {
     param([string]$Component)
     switch ($Component) {
         'docker' { 'optional' }
+        'wsl'    { 'optional' }
         'curl'   { 'required' }
         'unzip'  { 'required' }
         default  { 'recommended' }
@@ -54,37 +198,83 @@ function Get-PfWhy {
         'curl'    { 'Not needed on Windows - downloads use Invoke-WebRequest.' }
         'unzip'   { 'Not needed on Windows - archives are extracted by .NET.' }
         'rosetta' { 'Apple Silicon only.' }
-        'docker'  { 'Only for the Docker edition, which runs the Linux build in a container.' }
+        # Named, because the cost is worth knowing before paying it: three of the
+        # four engines have a Windows build and need none of this.
+        'wsl'     { 'The Linux machine the Docker edition runs in. On Windows that means Edge, which Microsoft ships only as an installer.' }
+        'docker'  { 'Only for the Docker edition. On Windows it runs inside WSL 2, which is the row above.' }
     }
 }
 
 function Get-PfFix {
     param([string]$Component, [string]$Status)
-    if ($Component -ne 'docker') { return '' }
-    if ($Status -eq 'inactive') {
-        # Start whatever is already on the machine. Nothing new is pulled in here,
-        # so Docker Desktop is fair game if the user chose to install it.
-        $desktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-        if (Test-Path $desktop) { return "Start `"$desktop`"" }
-        if (Test-Have wsl) { return 'wsl -e sudo service docker start' }
+
+    if ($Component -eq 'wsl') {
+        # The one step Windows will not let anything do quietly: enabling the
+        # feature needs administrator rights, and on most machines a restart
+        # after it. Asked for through the system's own elevation prompt, which is
+        # the same bargain lib/preflight.sh strikes for Rosetta on macOS.
+        #
+        # Bare `wsl --install` on purpose. What it does differs by build - some
+        # enable the feature and stop, some go on and fetch a distro - and that is
+        # survivable here because the next check reads the machine again rather
+        # than believing this. A flag that only exists on newer builds would not
+        # be.
+        if ($Status -eq 'missing') { return 'wsl --install' }
+        # The feature is on and there is no distro to run anything in. Ubuntu
+        # because that is what `wsl --install` picks unprompted, so a half-done
+        # install and a fresh one end in the same place.
+        if ($Status -eq 'inactive') { return 'wsl --install -d Ubuntu' }
         return ''
     }
-    # The docker CLI on its own - never Docker Desktop. Desktop is over a GB, wants
-    # admin rights and a reboot, and its licence is only free for small companies;
-    # this tool asks for none of that on the other platforms and will not here.
-    # The engine the CLI talks to is a separate decision - see Get-PfNote.
-    if (Test-Have winget) { return 'winget install -e --id Docker.DockerCLI' }
-    return ''
+
+    if ($Component -ne 'docker') { return '' }
+
+    # Docker Desktop, if the user chose it: starting what is already installed
+    # pulls nothing in, so it stays the first answer.
+    $desktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+    if ($Status -eq 'inactive' -and (Test-Path $desktop)) { return "Start `"$desktop`"" }
+
+    # Everything else happens inside the distro, as root, which is why none of it
+    # asks for anything. `wsl -e sudo service docker start` used to be offered
+    # here and could not work twice over: sudo wants a password nobody can type,
+    # and even when it succeeded the daemon it started was one the Windows docker
+    # CLI cannot see - that named pipe is Docker Desktop's, and nothing here sets
+    # DOCKER_HOST.
+    if (-not (Test-WslReady)) { return '' }
+    if ($Status -eq 'inactive') { return 'wsl -u root -e service docker start' }
+    # Docker's own convenience script, the same one lib/preflight.sh offers on
+    # Linux - because inside the distro this *is* Linux.
+    return 'wsl -u root -e sh -lc "curl -fsSL https://get.docker.com | sh"'
 }
 
 function Get-PfNote {
     param([string]$Component, [string]$Status)
+
+    if ($Component -eq 'wsl') {
+        if ($Status -eq 'missing') {
+            return 'Asks for administrator rights, and Windows usually wants a restart afterwards. Come back to this panel after it and carry on where you left off. If it fails outright, virtualisation is off in the firmware and only the BIOS can turn it on.'
+        }
+        if ($Status -eq 'inactive') {
+            return 'WSL is enabled and has no Linux in it yet. About 500 MB, and nothing to answer.'
+        }
+        return ''
+    }
+
     if ($Component -ne 'docker') { return '' }
-    if ($Status -eq 'inactive') { return 'Starts what is already installed. Nothing is downloaded.' }
-    return 'The docker CLI only, about 50 MB - not Docker Desktop. It still needs an engine to talk to: Docker Engine inside a WSL 2 distro (wsl --install).'
+    $desktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+    if ($Status -eq 'inactive' -and (Test-Path $desktop)) {
+        return 'Starts what is already installed. Nothing is downloaded.'
+    }
+    if (-not (Test-WslReady)) {
+        return 'Needs WSL 2 first - the row above. Docker runs inside it, not on Windows.'
+    }
+    if ($Status -eq 'inactive') { return 'Starts the daemon inside WSL. Nothing is downloaded.' }
+    return 'Docker Engine inside WSL, about 100 MB. Not Docker Desktop: no licence, no admin rights, no restart.'
 }
 
-$PfComponents = @('curl', 'unzip', 'python3', 'rosetta', 'docker')
+# wsl before docker: it is what docker needs, and the system check is read top
+# to bottom.
+$PfComponents = @('curl', 'unzip', 'python3', 'rosetta', 'wsl', 'docker')
 
 function Get-PfReport {
     $components = foreach ($id in $PfComponents) {
@@ -127,6 +317,58 @@ function Show-PfReport {
     return $problems
 }
 
+# ---------- starting other programs ----------
+# Start-Process joins -ArgumentList with plain spaces and quotes nothing, so any
+# argument holding one arrives split in pieces. A path is the usual casualty:
+# "C:\Users\Some Name\...", a Downloads folder holding a second copy as
+# "EngineShelf-1.1.5-Windows (1)", or plain "C:\Program Files".
+#
+#     powershell -File C:\...\EngineShelf-1.1.5-Windows (1)\app\x.ps1
+#     -> Processing -File 'C:\...\EngineShelf-1.1.5-Windows' failed because the
+#        file does not have a '.ps1' extension.
+#
+# gui/server.py has no such problem: it hands subprocess a list, and the list is
+# the argument vector. Every Start-Process in this tool goes through here instead.
+#
+# It lived in engineshelf.ps1, quoting the browser's own arguments and nothing
+# else, while five other call sites - every background job the manager starts
+# among them - passed paths raw.
+function Quote-Args {
+    param($items)
+    return @($items | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    })
+}
+
+# Which fixes Windows will not let a normal process do. Only one so far, and it
+# is the only one this tool is willing to ask for: turning WSL on. Everything
+# else either runs as the user or runs as root inside the distro, where root
+# costs nothing.
+function Test-PfNeedsElevation {
+    param([string]$Component)
+    return ($Component -eq 'wsl')
+}
+
+# The counterpart of the osascript block in lib/preflight.sh: where a fix genuinely
+# needs administrator rights, ask the system for them rather than failing halfway
+# through. The user sees Windows' own prompt and can say no.
+#
+# -Wait, because the caller checks what changed the moment this returns; without
+# it the check would race the installer. Output does not come back through the
+# job log - an elevated process cannot inherit these handles - so the state
+# afterwards is what the manager reports, not the transcript.
+function Invoke-Elevated {
+    param([string]$Command)
+    Write-Host "  Asking Windows for administrator rights. This runs in a window of its own."
+    $quoted = $Command -replace '"', '`"'
+    $proc = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
+        -ArgumentList (Quote-Args @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $quoted))
+    if ($proc.ExitCode -ne 0) { throw "it exited with $($proc.ExitCode)" }
+}
+
+# Which links of a chain have already been walked in this run.
+$script:PfChained = @{}
+
 # Prints exactly what it would run, asks, then runs it. Never installs silently.
 function Invoke-PfFix {
     param([string]$Component, [switch]$AssumeYes)
@@ -139,9 +381,10 @@ function Invoke-PfFix {
     if (-not $command) {
         Write-Host "X  $(Get-PfLabel $Component) cannot be installed automatically here." -ForegroundColor Red
         if ($Component -eq 'docker') {
-            Write-Host "   Install the CLI:  winget install -e --id Docker.DockerCLI"
-            Write-Host "   Then an engine for it to talk to: Docker Engine inside a WSL 2 distro."
-            Write-Host "   The native launcher needs none of this:  .\engineshelf.ps1 run 74"
+            Write-Host "   Docker runs inside WSL 2 here, and WSL is not usable yet."
+            Write-Host "   Install that first - it is the row above this one in the system check."
+            Write-Host "   Only the Docker edition needs it. The native launcher does not:"
+            Write-Host "     .\engineshelf.ps1 run 74"
         }
         return $false
     }
@@ -167,37 +410,56 @@ function Invoke-PfFix {
     }
 
     try {
-        Invoke-Expression $command
+        if (Test-PfNeedsElevation $Component) { Invoke-Elevated $command }
+        else { Invoke-Expression $command }
     } catch {
         Write-Host "X  That command did not complete: $($_.Exception.Message)" -ForegroundColor Red
         return $false
     }
 
-    # Only worth waiting for a daemon that something just started; installing the
-    # CLI on its own leaves nothing to wait for.
+    # Only worth waiting for a daemon that something just started; installing
+    # Docker on its own leaves nothing to wait for.
     if ($Component -eq 'docker' -and $status -eq 'inactive') {
         Write-Host "  Waiting for the Docker daemon" -NoNewline
         for ($i = 0; $i -lt 90; $i++) {
-            docker info 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { break }
+            # Both bracketed: bare `Test-WslDockerRunning -or ...` would hand the
+            # function a parameter called -or rather than testing anything.
+            if ((Test-WslDockerRunning) -or (Test-WindowsDocker)) { break }
             Write-Host "." -NoNewline
             Start-Sleep -Seconds 1
         }
         Write-Host ""
     }
 
-    # The CLI is installed but has no engine yet. If there is something that can
-    # be started, offer that now instead of making the user ask twice. Once only.
-    if ($Component -eq 'docker' -and $status -eq 'missing' -and -not $script:PfDockerChained) {
-        if ((Get-PfStatus 'docker') -eq 'inactive' -and (Get-PfFix 'docker' 'inactive')) {
-            $script:PfDockerChained = $true
-            return (Invoke-PfFix -Component docker -AssumeYes:$AssumeYes)
+    # One press, as far as one press can get. Each link re-reads the machine
+    # rather than assuming the last one worked, so a step that half-succeeded
+    # stops the chain honestly instead of running the next one against nothing.
+    # Once per link, so a component that refuses to come up cannot loop.
+    $after = Get-PfStatus $Component
+    if ($after -ne 'ok' -and $after -ne $status -and -not $script:PfChained[$Component]) {
+        $script:PfChained[$Component] = $true
+        if (Get-PfFix $Component $after) {
+            return (Invoke-PfFix -Component $Component -AssumeYes:$AssumeYes)
         }
     }
+    # WSL coming up is what Docker was waiting for. Carry straight on rather than
+    # making somebody find the other button.
+    if ($Component -eq 'wsl' -and $after -eq 'ok' -and -not $script:PfChained['wsl->docker']) {
+        $script:PfChained['wsl->docker'] = $true
+        Write-Host "  WSL 2 is ready. Docker Engine goes inside it - carrying on."
+        return (Invoke-PfFix -Component docker -AssumeYes:$AssumeYes)
+    }
 
-    if ((Get-PfStatus $Component) -eq 'ok') {
+    if ($after -eq 'ok') {
         Write-Host "  $(Get-PfLabel $Component) is ready." -ForegroundColor Green
         return $true
+    }
+    if ($Component -eq 'wsl') {
+        # Not a failure. Windows enables the feature and then wants the machine
+        # back, and there is no way to finish from this side of the restart.
+        Write-Host "!  WSL 2 is installed but not answering yet." -ForegroundColor Yellow
+        Write-Host "   Restart Windows, then press this again - it will pick up from here."
+        return $false
     }
     Write-Host "!  $(Get-PfLabel $Component) still is not usable." -ForegroundColor Yellow
     return $false
