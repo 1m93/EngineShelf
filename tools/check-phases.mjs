@@ -30,6 +30,7 @@ globalThis.document = {
   querySelector: () => nul,
   querySelectorAll: () => [],
   createElement: () => nul,
+  createDocumentFragment: () => nul,
   documentElement: { dataset: {} },
   addEventListener: () => {},
 };
@@ -55,9 +56,10 @@ process.on('unhandledRejection', () => {});
 
 const src = readFileSync(APP, 'utf8');
 const mod = await import(
-  'data:text/javascript,' + encodeURIComponent(src + '\nexport { readJob, PHASE_MARKS };')
+  'data:text/javascript,' +
+    encodeURIComponent(src + '\nexport { readJob, PHASE_MARKS, logKind };')
 );
-const { readJob } = mod;
+const { readJob, logKind } = mod;
 
 // Exactly what engineshelf.sh prints with colours off (stdout is not a tty for
 // every launch the manager makes). Label is "<engine display> <version>".
@@ -153,6 +155,73 @@ const unknownSize = [
 show('ps meter with no total', { phase: 'downloading', percent: null, detail: null },
      readJob(unknownSize));
 
+// ---------------------------------------------------------------------------
+// The same coupling, one step further: the log panel colours each line by what
+// the CLI called it. Same failure mode as the phases above, and the same reason
+// to pin both halves - the shell CLI marks a result "v ... ready." and the
+// PowerShell one marks it "OK ... ready.", so a rule written against whichever
+// machine its author uses leaves the other platform's log all one grey.
+console.log('');
+
+const kinds = [
+  // Both CLIs' own marks, and lib/preflight.sh's indented ones.
+  ['x  Unsupported OS: Windows. On Windows use engineshelf.ps1.', 'bad'],
+  ['X  Missing catalog: C:\\EngineShelf\\catalog.tsv', 'bad'],
+  ['  x Docker cannot be installed automatically here.', 'bad'],
+  ['!  This build is x86_64 and Rosetta does not look installed.', 'warn'],
+  ['  ! Docker still is not usable.', 'warn'],
+  ['v Chromium 120.0.6099.0 ready.', 'ok'],
+  ['OK Chromium 120.0.6099.0 ready.', 'ok'],
+  ['v Built. Nothing is running: start 120 opens it.', 'ok'],
+  ['OK Built. Nothing is running: start 120 opens it.', 'ok'],
+  ['  ok Docker is ready.', 'ok'],
+  // lib/preflight.ps1 colours this one green rather than marking it, so on
+  // Windows it arrives with nothing in front of it at all. "ready." is what
+  // catches it, which is why that phase mark earns its place twice over.
+  ['  Docker is ready.', 'ok'],
+
+  // What the page already reads for progress, wearing the colour that goes
+  // with it. One table, so these cannot drift apart.
+  ['Downloading Chromium 120.0.6099.0 (Mac_Arm, one time only)', 'step'],
+  ['Downloading WebKit 26.5 (mac-26-arm64, one time only)', 'step'],
+  ['Extracting...', 'step'],
+  ['  > Chromium 120.0.6099.0 (Mac_Arm)', 'up'],
+  ['  > http://localhost:6080/vnc.html?autoconnect=1&resize=scale', 'up'],
+  ['  > Chromium 120.0.6099.0 is already running  http://localhost:6080/', 'up'],
+
+  // Noise: the meters both CLIs draw, and the asides they print dim.
+  ['  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current', 'quiet'],
+  [meter, 'quiet'],
+  [psMeter, 'quiet'],
+  ['-> /Users/you/.engineshelf/builds/chromium-1217362', 'quiet'],
+  ['  Profile: /Users/you/.engineshelf/profiles/chromium-1217362', 'quiet'],
+  ['  Log: /Users/you/.engineshelf/logs/chromium-1217362.log', 'quiet'],
+
+  // The divider both managers write between two runs on one target. server.ps1
+  // builds it out of [char]0x2500 because that file stays ASCII; it has to
+  // arrive here as the same character server.py writes literally.
+  ['\u2500\u2500 Chromium 120.0.6099.0 \u00b7 14:22:07 \u2500\u2500', 'rule'],
+
+  // A container build, which is most of what this panel ever holds.
+  ['#12 [4/9] RUN apt-get install -y --no-install-recommends libvpx6', 'step'],
+  ['#12 12.34 Setting up libvpx6:amd64 (1.8.2-1build1) ...', 'quiet'],
+  ['#12 12.34 E: Unable to locate package libvpx6', 'bad'],
+  ['#12 12.34 W: Target Packages is configured multiple times', 'warn'],
+  ['ERROR: failed to solve: process "/bin/sh -c apt-get install -y libvpx6" ' +
+     'did not complete successfully: exit code: 100', 'bad'],
+  ['./engineshelf-docker.sh: line 12: docker: command not found', 'bad'],
+
+  // Nothing to say about these, and saying it in colour would be worse.
+  ['', ''],
+  ['  Copy and paste work across the tab in both directions.', ''],
+];
+
+for (const [line, want] of kinds) {
+  const label = line.length > 46 ? `${line.slice(0, 43)}...` : line || '(blank)';
+  show(`kind: ${label}`, want, logKind(line));
+}
+
 console.log(bad ? `\n${bad} FAILURES`
-                : '\nall phases detected for all four engines, on both CLIs');
+                : '\nall phases detected for all four engines, on both CLIs, ' +
+                  'and every line kind with them');
 process.exit(bad ? 1 : 0);

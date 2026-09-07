@@ -1654,6 +1654,73 @@ body.booting #disk-text {
   word-break: break-word;
 }
 
+/* ---------- one line, coloured by what it is ----------
+   logKind() in app.js reads each line off the CLI's own wording and hands it one
+   of these. The scale is deliberately short: the body sits a shade above the
+   panel's own grey so it reads as text rather than as chrome, build noise sinks
+   below it, and only the four things worth finding in a ten-thousand-line
+   container build come up out of it.
+
+   Every line is a block so a whole row can be tinted, and the two that are
+   tinted bleed through the panel's padding - an error you can find by scrolling
+   past it is the point of colouring this at all. */
+.log-ln {
+  display: block;
+  /* A blank line has nothing to give a block any height, and the blank lines
+     either side of a run divider are what separate one run from the next. */
+  min-height: 1.65em;
+  color: var(--c-dim);
+}
+/* Progress frames, `docker build` chatter, and the asides about where a file
+   landed. Present, skimmed past. */
+.log-ln.is-quiet {
+  color: var(--c-faint);
+}
+/* "Downloading Chromium 120", "[4/9] RUN apt-get ..." - where the eye stops
+   when somebody scrolls a long build looking for what it is doing now. */
+.log-ln.is-step {
+  color: var(--c-text);
+  font-weight: 600;
+}
+.log-ln.is-ok {
+  color: var(--c-ok);
+}
+.log-ln.is-warn {
+  color: var(--c-warn);
+}
+.log-ln.is-bad {
+  color: var(--c-danger);
+  background: color-mix(in srgb, var(--c-danger) 11%, transparent);
+  /* Out through the padding on both sides, so a failure is a band across the
+     panel rather than a differently-coloured sentence. */
+  margin: 0 -13px;
+  padding: 0 13px;
+}
+/* The browser is up, and the address it is up at. */
+.log-ln.is-up {
+  color: var(--c-accent);
+  font-weight: 600;
+}
+/* The divider the manager writes between two runs on one target. Read as a
+   seam rather than as a line of text: it is what somebody scrolls to when they
+   want the run before this one. */
+.log-ln.is-rule {
+  color: var(--c-accent);
+  background: color-mix(in srgb, var(--c-accent) 10%, transparent);
+  margin: 0 -13px;
+  padding: 0 13px;
+}
+/* Lifted out of whatever line it is on, because it is the one thing in a log
+   somebody means to select and copy. */
+.log-url {
+  color: var(--c-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.log-ln.is-bad .log-url {
+  color: inherit;
+}
+
 /* "This manager keeps serving after you close the window" - true only when it was
    started that way, so it is absent rather than reassuring the rest of the
    time. */
