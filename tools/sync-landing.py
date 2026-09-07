@@ -290,12 +290,21 @@ def main():
         print("catalog.tsv has no usable rows", file=sys.stderr)
         return 1
     # An engine with no rows at all means discover.py has never run for it, or
-    # ran and could not reach the vendor. Emptying its tab on the page would
-    # read as "this engine is gone" rather than "nobody asked recently".
+    # ran and could not reach the vendor, or something upstream ate the S block.
+    # Emptying its tab on the page would read as "this engine is gone" rather
+    # than "nobody asked recently", so this stops rather than writing.
+    #
+    # It used to print this and write anyway. On 2026-08-31 refresh-catalog.py
+    # rewrote catalog.tsv without the S rows, this ran next in the same workflow,
+    # said its piece into a log nobody reads and published a page with an empty
+    # shelf for all four engines and a hero counting zero versions. A warning is
+    # not a guard when the caller is a cron job.
     empty = [e for e in SHELF_ENGINES if not shelf.get(e)]
     if empty:
-        print("no shelf rows for %s - run tools/discover.py --write"
-              % ", ".join(empty), file=sys.stderr)
+        print("no shelf rows for %s - run tools/discover.py --write; "
+              "refusing to write an empty shelf to %s"
+              % (", ".join(empty), PAGE), file=sys.stderr)
+        return 1
     features = read_features(shelf, entries)
 
     current = open(PAGE, encoding="utf-8").read()
