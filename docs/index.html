@@ -6705,15 +6705,21 @@
         let engine = 'chromium',
           list = [],
           idx = 3,
-          dragging = false;
+          dragging = false,
+          measuring = false;
 
         function render() {
           const m = list[idx];
           if (!m) return;
           const meta = ENGINE_META[engine];
           const pct = (idx / Math.max(1, list.length - 1)) * 100 + '%';
-          cursor.style.left = pct;
-          progress.style.width = pct;
+          // Both of these slide under a transition, and holdCardHeight below
+          // walks the whole shelf inside one task: moving them there would
+          // leave the cursor animating back from wherever the walk ended.
+          if (!measuring) {
+            cursor.style.left = pct;
+            progress.style.width = pct;
+          }
           $('mEngine').textContent = meta.name;
           $('mVer').textContent = m.v;
           $('mCmd').textContent = meta.cmd(m);
@@ -6745,6 +6751,54 @@
           track.setAttribute('aria-valuenow', String(idx));
           track.setAttribute('aria-valuetext', meta.name + ' ' + m.v);
         }
+
+        /* ---------- a card that holds its height ----------
+     Every row prints a different amount of card: the note runs from one line
+     to five, the count under it is empty for a build MDN has no compat data
+     for, and on a phone the mono row opposite wraps for the engines whose full
+     version is long enough. So the card changed height on every step of the
+     scrubber - and it steps by itself every 2.3s, with nobody touching it -
+     which walked the era grid, and the rest of the page under it, up and down
+     while it was being read.
+
+     No height for that is written down here, because how tall a note is is the
+     width it is printed at: the shelf on screen is walked once, at that width,
+     and the card holds the tallest row the walk found. Re-measured on resize
+     for the same reason, and skipped while the card has no width to be measured
+     at. */
+        function holdCardHeight() {
+          const card = $('shelfCard');
+          if (!card) return;
+          if (!card.clientWidth || !list.length) return;
+          const at = idx;
+          measuring = true;
+          card.style.minHeight = '';
+          let tallest = 0;
+          for (idx = 0; idx < list.length; idx++) {
+            render();
+            // offsetHeight rounds, and a card rounded down by half a pixel is
+            // a card the tallest row still grows by half a pixel.
+            tallest = Math.max(tallest, card.getBoundingClientRect().height);
+          }
+          idx = at;
+          measuring = false;
+          render();
+          card.style.minHeight = Math.ceil(tallest) + 'px';
+        }
+
+        // A resize burst is one walk per frame at most. The repaint that changes
+        // engines measures on the spot instead: a frame of the old engine's
+        // height would be a jump of its own, on the one action that has somebody
+        // watching the card when it lands.
+        let holdFrame = 0;
+        function holdCardHeightSoon() {
+          if (holdFrame) return;
+          holdFrame = requestAnimationFrame(() => {
+            holdFrame = 0;
+            holdCardHeight();
+          });
+        }
+        addEventListener('resize', holdCardHeightSoon);
 
         function setFromX(clientX) {
           const r = track.getBoundingClientRect();
@@ -6982,6 +7036,7 @@
           renderTicks();
           renderEras();
           render();
+          holdCardHeight();
         }
 
         function setEngine(next, focus) {
