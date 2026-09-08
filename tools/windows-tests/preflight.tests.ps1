@@ -15,9 +15,9 @@ $LiftFrom = './lib/preflight.ps1'
 $LiftFunctions = @(
     'Get-PfStatus', 'Get-PfLabel', 'Get-PfNeed', 'Get-PfWhy', 'Get-PfFix',
     'Get-PfNote', 'Get-PfReport', 'Test-WindowsDocker', 'Test-WslReady',
-    'Invoke-Wsl', 'Test-WslDocker', 'Test-WslDockerRunning',
-    'Test-PfNeedsElevation', 'Get-DockerRoute', 'Clear-DockerRoute',
-    'Invoke-DockerHere', 'Quote-Args'
+    'Invoke-WslHere', 'Invoke-Wsl', 'Test-WslDocker', 'Test-WslDockerRunning',
+    'ConvertTo-WslPath', 'Test-PfNeedsElevation', 'Get-DockerRoute',
+    'Clear-DockerRoute', 'Invoke-DockerHere', 'Quote-Args'
 )
 $LiftVariables = @('PfComponents', 'PfDockerRoute')
 . "$PSScriptRoot/harness.ps1"
@@ -275,5 +275,60 @@ Set-Box @{}
 Test-That 'the route is remembered' (Get-DockerRoute) 'windows'
 Clear-DockerRoute
 Test-That 'until something says it may have changed' (Get-DockerRoute) ''
+
+Write-Host ''
+Write-Host 'a Windows with no WSL is an answer, not a crash'
+# The machine most people have. wsl.exe is in System32 on every Windows 10 and
+# 11, so Test-Have finds it and `wsl -l -q` runs - and with the feature switched
+# off it says so on stderr:
+#
+#     wsl : The Windows Subsystem for Linux is not installed. You can install by
+#     running 'wsl.exe --install'.
+#
+# Windows PowerShell turns that into an error record, `$ErrorActionPreference =
+# 'Stop'` makes it terminate, and the `2>$null` written on that line does not
+# reach it. gui/server.ps1 asks for the Docker route at startup, before any
+# handler is there to catch anything, so the manager printed that and quit:
+# EngineShelf.bat, double-clicked, on a machine that only ever wanted the native
+# launcher. Write-Error stands in for what 5.1 does with stderr - the same
+# record, obeying the same preference - because a stub cannot write to a stream
+# it does not have.
+function wsl {
+    Write-Error "The Windows Subsystem for Linux is not installed. You can install by running 'wsl.exe --install'."
+    $global:LASTEXITCODE = 1
+    return ''
+}
+Clear-DockerRoute
+Set-Box @{ wslExe = $true }
+$ErrorActionPreference = 'Stop'
+
+$threw = $false; $ready = $null
+try { $ready = Test-WslReady } catch { $threw = $true }
+Test-That 'asking for the distro list does not end the run' $threw $false
+Test-That 'and WSL reads as not ready' $ready $false
+
+$threw = $false
+try { $null = Get-DockerRoute } catch { $threw = $true }
+Test-That 'the docker route survives being asked' $threw $false
+Test-That 'and there is no route to docker' (Get-DockerRoute) ''
+
+$threw = $false
+try { $null = Get-PfReport } catch { $threw = $true }
+Test-That 'the whole system check survives it' $threw $false
+
+$threw = $false; $converted = $null
+try { $converted = ConvertTo-WslPath 'C:\Users\a b\x' } catch { $threw = $true }
+Test-That 'so does converting a path' $threw $false
+Test-That 'which falls back to the path it was given' $converted 'C:\Users\a b\x'
+Test-That 'the preference is put back' $ErrorActionPreference 'Stop'
+$ErrorActionPreference = 'Continue'
+
+# One command for both machines that read as 'inactive' - no distro, or no
+# feature at all - because nothing here can tell them apart.
+$wsl = Read-Row 'wsl'
+Test-That 'the row offers the one command that covers both' $wsl.fix 'wsl --install -d Ubuntu'
+Test-That 'and warns about the administrator prompt' ($wsl.note -match 'administrator') $true
+Test-That 'and about the restart it may want' ($wsl.note -match 'restart') $true
+Test-That 'while still promising nothing to answer during it' ($wsl.note -match 'nothing to answer') $true
 
 Exit-WithTally

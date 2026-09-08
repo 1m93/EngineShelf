@@ -1983,7 +1983,16 @@ if (-not $listener) { throw "No free port between $Port and $($Port + 40)" }
 
 # Before anything of ours can be up, so the snapshot is honest about what was
 # already running.
-Set-InheritedContainers
+#
+# In a try, because this is the first thing here that asks the machine a
+# question, and it asks it on the one thread that serves HTTP. server.py asks
+# the same question on a daemon thread (`threading.Thread(target=note_inherited)`),
+# where anything thrown lands in that thread and the manager still starts;
+# there is no such place here. A `wsl` that answered on stderr used to take the
+# whole manager down from this line, before the first request - so whatever the
+# answer costs, not knowing it is a manager with an empty inherited set, not no
+# manager at all.
+try { Set-InheritedContainers } catch { }
 
 $url = "http://127.0.0.1:$Port/"
 

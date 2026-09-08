@@ -41,12 +41,44 @@ function Test-WindowsDocker {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Every wsl call in this file goes through here, and for the reason
+# Invoke-DockerHere spells out further down: Windows PowerShell turns a native
+# command's stderr into an error record, and `$ErrorActionPreference = 'Stop'` -
+# which gui.ps1, gui/server.ps1 and both launchers set - makes that record
+# terminate the script. A `2>$null` on the call itself does not save it. The
+# record is raised under whatever preference is in force where the command runs
+# and only redirected afterwards, so the preference has to be lowered around the
+# call, which is what this is.
+#
+# Not a hypothetical. `wsl -l -q` on a Windows with the feature switched off is
+# answering the question, not failing:
+#
+#     wsl : The Windows Subsystem for Linux is not installed. You can install by
+#     running 'wsl.exe --install'.
+#
+# and wsl.exe is in System32 on every Windows 10 and 11, so Test-Have finds it
+# and that line always ran. gui/server.ps1 asks for the Docker route at startup
+# (Set-InheritedContainers), before any request handler is there to catch
+# anything, so double-clicking EngineShelf.bat printed that error and stopped -
+# on every machine without WSL, which is most of them.
+#
+# No param block, deliberately, for the same reason as Invoke-DockerHere: one
+# [Parameter()] makes this an advanced function, whose common parameters are
+# prefix-matched, and `-u root` would bind to -Verbose's neighbours rather than
+# reaching wsl. A plain function binds nothing and passes $args through as
+# written.
+function Invoke-WslHere {
+    $was = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & wsl @args } finally { $ErrorActionPreference = $was }
+}
+
 # A distro that answers. `wsl -l -q` lists installed ones; the command exists on
 # machines where the feature is not enabled at all, so the list is the question,
 # not the executable.
 function Test-WslReady {
     if (-not (Test-Have wsl)) { return $false }
-    $found = wsl -l -q 2>$null
+    $found = Invoke-WslHere -l -q 2>$null
     if ($LASTEXITCODE -ne 0) { return $false }
     return ((@($found) -join '').Trim().Length -gt 0)
 }
@@ -54,7 +86,7 @@ function Test-WslReady {
 # Inside the distro, as root - no sudo, so nothing to answer.
 function Invoke-Wsl {
     param([string]$Command)
-    $out = wsl -u root -e sh -lc $Command 2>&1
+    $out = Invoke-WslHere -u root -e sh -lc $Command 2>&1
     return @{ code = $LASTEXITCODE; out = (@($out) -join "`n") }
 }
 
@@ -91,7 +123,7 @@ function Get-DockerRoute {
 # are named, not mounted from disk.
 function ConvertTo-WslPath {
     param([string]$Path)
-    $converted = wsl -u root -e wslpath -u $Path 2>$null
+    $converted = Invoke-WslHere -u root -e wslpath -u $Path 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $converted) { return $Path }
     return ("$converted").Trim()
 }
@@ -133,7 +165,7 @@ function Invoke-DockerHere {
     try {
         switch (Get-DockerRoute) {
             'windows' { & docker @args }
-            'wsl'     { & wsl -u root -e docker @args }
+            'wsl'     { Invoke-WslHere -u root -e docker @args }
             default {
                 # Nothing to run it with. Callers check $LASTEXITCODE the way they
                 # do for a docker that answered badly, so this has to look the same.
@@ -220,9 +252,15 @@ function Get-PfFix {
         # than believing this. A flag that only exists on newer builds would not
         # be.
         if ($Status -eq 'missing') { return 'wsl --install' }
-        # The feature is on and there is no distro to run anything in. Ubuntu
-        # because that is what `wsl --install` picks unprompted, so a half-done
-        # install and a fresh one end in the same place.
+        # Two machines read as this one status and one command has to suit both:
+        # the feature is on with no distro to run anything in, or the feature is
+        # off and `wsl.exe` is the stub Windows ships regardless. Nothing tells
+        # them apart that can be trusted - the message wsl prints is localised,
+        # and `wsl --status` is not on every build - so neither is guessed at.
+        # `wsl --install -d Ubuntu` covers both: it enables whatever is missing
+        # and then fetches the distro. Ubuntu because that is what bare
+        # `wsl --install` picks unprompted, so a half-done install and a fresh
+        # one end in the same place.
         if ($Status -eq 'inactive') { return 'wsl --install -d Ubuntu' }
         return ''
     }
@@ -255,7 +293,11 @@ function Get-PfNote {
             return 'Asks for administrator rights, and Windows usually wants a restart afterwards. Come back to this panel after it and carry on where you left off. If it fails outright, virtualisation is off in the firmware and only the BIOS can turn it on.'
         }
         if ($Status -eq 'inactive') {
-            return 'WSL is enabled and has no Linux in it yet. About 500 MB, and nothing to answer.'
+            # Says both halves of what this state can be, because the fix runs
+            # the same command either way and only one of the two wants a
+            # restart. Promising "no restart" to the machine that needs one is
+            # the worse mistake of the two.
+            return 'Installs whatever is missing - the Linux, or the Windows feature underneath it, or both. About 500 MB and nothing to answer, but it asks for administrator rights and Windows may want a restart afterwards. Come back to this panel after it and carry on where you left off.'
         }
         return ''
     }

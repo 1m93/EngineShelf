@@ -105,6 +105,21 @@ entry nobody needs any more, so the list cannot rot into permission to diverge.
   PowerShell library has `$EngineList` behind `Test-EngineKnown`, the manager has
   its own `$EngineNames` — and reaching for the wrong one costs a feature.
   `tools/check-psvars.ps1` catches it; it found four, in two files.
+- **A native command's stderr is an error record, and `2>$null` does not stop
+  it.** Windows PowerShell turns every stderr line an `.exe` writes into one, and
+  under `$ErrorActionPreference = 'Stop'` — which `gui.ps1`, `gui/server.ps1` and
+  both launchers set — that record terminates the script. The redirection on the
+  line is applied *after* the record is raised, so it discards nothing:
+  `wsl -l -q 2>$null` on a Windows with WSL switched off printed Microsoft's
+  "not installed" line and took the manager down from `Set-InheritedContainers`,
+  before the first request, on every machine that only ever wanted the native
+  launcher. A native call belongs behind a helper that lowers the preference for
+  exactly the length of the call — `Invoke-WslHere`, `Invoke-DockerHere` — which
+  leaves the record non-terminating and every caller's own `2>$null` or `2>&1`
+  working. PowerShell 7 raises the same record for a nonzero exit code instead,
+  so the helper is what holds on both. And what the one HTTP thread asks the
+  machine at startup goes in a `try`: `server.py` asks it on a daemon thread,
+  where a throw costs the answer rather than the manager.
 - **A job gets nothing on stdin.** `server.py` hands every child
   `stdin=subprocess.DEVNULL`; `Start-Process` inherits unless told
   `-RedirectStandardInput`, and an inherited stdin that never answers is a job
