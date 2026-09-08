@@ -132,6 +132,32 @@ entry nobody needs any more, so the list cannot rot into permission to diverge.
   wording (`Downloading <Engine> …`, `Extracting...`, `… ready.`, `  > <Engine> …`);
   `tools/check-phases.mjs` asserts it for both CLIs.
 
+## 5. What a release note says
+
+The GitHub release body **is** the changelog. A workflow copies it into
+`docs/release.json` on publish and on edit and the landing page reads that file,
+so `release.json` is never written by hand. The draft lives at the root as
+`RELEASE-NOTES-<version>.md` and is what gets pasted into the release.
+
+- **Two sections, `## Fixed` and `## Upgrading`.** A section with nothing to say
+  is left out, not filled — no "Changed", no "Internal", no thanks.
+- **A bullet opens with the symptom, in bold, the way whoever hit it would say
+  it.** "The manager would not start on a machine without WSL 2", not "fixed
+  `Test-WslReady`". Then a line or two of mechanism, for whoever has to believe
+  it.
+- **Say which half it happened on, and which was never affected.** Every rule
+  above this one exists because one platform's bug was invisible on the other,
+  and a note that hides that has the other half upgrading for nothing: "Windows
+  only", "the repo checkout was never affected".
+- **`## Upgrading` is only what the reader has to do** — rebuild this image,
+  press that row — and it ends with the line saying the rest needs nothing and
+  that browsers and profiles are untouched. Anyone who *must* take the release
+  is told so, and why, in one sentence.
+- **A number in a note is measured, not remembered.** "Five of fifty-three
+  rows", "all 288 shelf rows", "the run of 2026-08-31" — counted off the
+  catalog, the diff or the log at the time of writing, because a number nobody
+  checked is the part a reader tests first.
+
 ## Before you call a change done
 
 ```bash
