@@ -17,9 +17,16 @@ $LiftFunctions = @(
     'Get-PfNote', 'Get-PfReport', 'Test-WindowsDocker', 'Test-WslReady',
     'Invoke-WslHere', 'Invoke-Wsl', 'Test-WslDocker', 'Test-WslDockerRunning',
     'ConvertTo-WslPath', 'Test-PfNeedsElevation', 'Get-DockerRoute',
-    'Clear-DockerRoute', 'Invoke-DockerHere', 'Quote-Args'
+    'Clear-DockerRoute', 'Invoke-DockerHere', 'Invoke-DockerAsk', 'Quote-Args',
+    'Split-Lines', 'Get-PfAnswer', 'Start-PfMemo', 'Stop-PfMemo'
 )
-$LiftVariables = @('PfComponents', 'PfDockerRoute')
+# Stubbed below rather than run: it starts a real child process, which is the
+# whole point of it. Named here so a rename in the real file fails this suite
+# instead of quietly leaving the stub answering for something nothing calls.
+$LiftInspect = @('Invoke-Bounded')
+$LiftVariables = @('PfComponents', 'PfDockerRoute', 'PfTimedOut', 'PfMemo',
+                   'PfRouteAskedAt', 'PfRouteRetrySeconds',
+                   'PfAskSeconds', 'PfWslSeconds', 'PfVolumeSeconds')
 . "$PSScriptRoot/harness.ps1"
 
 # Windows always has this; PowerShell on a Mac does not, and Join-Path throws on
@@ -47,7 +54,43 @@ function Test-Have {
 }
 function Test-Path { param($Path) return $script:box.desktop }
 
-# The two executables the chain leans on, answering as the box would.
+# The two executables the chain leans on, answering as the box would - through
+# Invoke-Bounded, which is where every probe goes now. A time limit means a child
+# process, and a child process is not something a function stub can stand in
+# front of, so this is the seam. Every call through it is kept, so the shape of
+# what was asked - and the limit it was asked with - can be asserted too.
+$script:asked = @()
+function Invoke-Bounded {
+    param([string]$File, [string[]]$Arguments = @(), [int]$Seconds = 8)
+    $line = ($Arguments -join ' ')
+    $script:asked += , @{ file = $File; line = $line; seconds = $Seconds }
+    $answer = @{ code = 127; out = ''; timedOut = $false }
+    if ($script:slow -and $script:slow -eq "$File $line") {
+        $answer.code = 124
+        $answer.timedOut = $true
+        $script:PfTimedOut = $true
+        return $answer
+    }
+    if ($File -eq 'docker') {
+        $answer.code = $(if ($script:box.winDocker) { 0 } else { 1 })
+        return $answer
+    }
+    if ($File -eq 'wsl') {
+        $answer.code = 0
+        if ($line -match '-l -q') {
+            if (-not $script:box.distro) { $answer.code = 1 } else { $answer.out = "Ubuntu`n" }
+        } elseif ($line -match 'command -v docker') {
+            $answer.code = $(if ($script:box.dockerInWsl) { 0 } else { 1 })
+        } elseif ($line -match 'docker info') {
+            $answer.code = $(if ($script:box.dockerUp) { 0 } else { 1 })
+        }
+    }
+    return $answer
+}
+$script:slow = $null
+
+# Still here, and still real: Invoke-DockerHere is the passthrough the launcher
+# runs its builds through, and what it hands the machine is pinned further down.
 function wsl {
     $line = ($args -join ' ')
     if ($line -match '^-l -q') {
@@ -323,8 +366,99 @@ Test-That 'which falls back to the path it was given' $converted 'C:\Users\a b\x
 Test-That 'the preference is put back' $ErrorActionPreference 'Stop'
 $ErrorActionPreference = 'Continue'
 
+# All four of those now hold for a second reason as well, and the stronger one:
+# a probe is a child process, where a line on stderr is a pipe to read rather
+# than an error record raised in this scope. The preference dance is still there
+# for Invoke-WslHere and Invoke-DockerHere, which is where the launcher's real
+# work goes, but nothing on the way to an answer runs a native command inline
+# any more. Asserted off the parse tree, so putting `& wsl` back in one of these
+# fails here rather than on somebody's machine.
+function Get-CallsIn {
+    param([string]$Name)
+    return @($LiftedFunctions[$Name].FindAll({
+        $args[0] -is [System.Management.Automation.Language.CommandAst]
+    }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
+}
+foreach ($probe in @('Test-WslReady', 'Test-WindowsDocker', 'Invoke-Wsl')) {
+    $calls = Get-CallsIn $probe
+    Test-That "$probe runs nothing inline" `
+        ((@($calls) -contains 'wsl') -or (@($calls) -contains 'docker')) $false
+    Test-That "$probe asks through Invoke-Bounded" (@($calls) -contains 'Invoke-Bounded') $true
+}
+
+Write-Host ''
+Write-Host 'every question put to the machine has an end to it'
+Clear-DockerRoute
+Set-Box @{ wslExe = $true; distro = $true; dockerInWsl = $true; dockerUp = $true }
+$script:asked = @()
+$null = Get-PfReport
+Test-That 'the report did ask it something' ($script:asked.Count -gt 0) $true
+Test-That 'and every one of them carried a limit' `
+    (@($script:asked | Where-Object { $_.seconds -le 0 }).Count) 0
+# The two limits are not the same question: listing the distros does not start
+# one, and running a command inside it does.
+Test-That 'the one that may boot the distro gets the longer limit' `
+    (@($script:asked | Where-Object { $_.line -match 'sh -lc' -and $_.seconds -ne $PfWslSeconds }).Count) 0
+Test-That 'the listing gets the cheap one' `
+    (@($script:asked | Where-Object { $_.line -match '-l -q' -and $_.seconds -ne $PfAskSeconds }).Count) 0
+
+Write-Host ''
+Write-Host 'a probe that ran out of time is not an answer'
+# The difference that matters: '' cached for the life of the manager because
+# Docker Desktop was slow to start would shut the Docker half of every row until
+# a job happened to end, and nobody could see why.
+Clear-DockerRoute; Set-Box @{ winDocker = $true }
+$script:slow = 'docker info'
+Test-That 'no route to docker, for now' (Get-DockerRoute) ''
+Test-That 'and nothing was written down' $script:PfDockerRoute $null
+
+# Not written down, and not asked again by the next caller either: one state
+# build asks for the route half a dozen times over, and a probe chain each time
+# is what made a wedged Docker Desktop into a forty-second /api/state.
+$script:asked = @()
+Test-That 'the caller behind it gets the same answer' (Get-DockerRoute) ''
+Test-That 'without asking the machine again' $script:asked.Count 0
+
+# And once the window is up - which is all Clear-DockerRoute does to it - the
+# question is put again rather than being settled for the run.
+$script:slow = $null
+Clear-DockerRoute
+$script:asked = @()
+Test-That 'later, it asks again' (Get-DockerRoute) 'windows'
+Test-That 'and did ask' ($script:asked.Count -gt 0) $true
+Test-That 'an answer is remembered, being one' $script:PfDockerRoute 'windows'
+
+Write-Host ''
+Write-Host 'what the manager reads back from docker'
+# Every one of these is on the path of a state poll, which the page makes every
+# second while anything is running. Invoke-DockerAsk is the bounded half of the
+# pair; Invoke-DockerHere, unbounded, stays for `docker build`.
+Clear-DockerRoute; Set-Box @{ winDocker = $true }
+$script:asked = @()
+$answer = Invoke-DockerAsk @('ps', '-a')
+Test-That 'it goes the way the route says' $script:asked[-1].file 'docker'
+Test-That 'with the arguments it was given' $script:asked[-1].line 'ps -a'
+Test-That 'and a limit of its own' $script:asked[-1].seconds $PfAskSeconds
+$null = Invoke-DockerAsk @('system', 'df', '-v') $PfVolumeSeconds
+Test-That 'the volume read gets the longer one' $script:asked[-1].seconds $PfVolumeSeconds
+Clear-DockerRoute; Set-Box @{ wslExe = $true; distro = $true; dockerInWsl = $true }
+$null = Invoke-DockerAsk @('images')
+Test-That 'inside the distro, as root, when that is where docker is' `
+    $script:asked[-1].line '-u root -e docker images'
+Clear-DockerRoute; Set-Box @{}
+$answer = Invoke-DockerAsk @('ps')
+Test-That 'and with no docker anywhere it answers like a missing command' $answer.code 127
+
+Write-Host ''
+Write-Host 'output comes back as the lines a caller wanted'
+Test-That 'both endings' (Split-Lines "a`r`nb`nc") @('a', 'b', 'c')
+Test-That 'blank lines are not rows' (@(Split-Lines "a`n`n`nb")).Count 2
+Test-That 'nothing at all is no rows' (@(Split-Lines '')).Count 0
+Test-That 'and neither is nothing' (@(Split-Lines $null)).Count 0
+
 # One command for both machines that read as 'inactive' - no distro, or no
 # feature at all - because nothing here can tell them apart.
+Clear-DockerRoute; Set-Box @{ wslExe = $true }
 $wsl = Read-Row 'wsl'
 Test-That 'the row offers the one command that covers both' $wsl.fix 'wsl --install -d Ubuntu'
 Test-That 'and warns about the administrator prompt' ($wsl.note -match 'administrator') $true

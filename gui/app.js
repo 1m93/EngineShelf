@@ -375,22 +375,52 @@ const runningDoctorJob = (component) =>
 
 /* ---------- api ---------- */
 
+// A request that never answers is not the same thing as one that fails, and it
+// used to be much the worse of the two: fetch waits for as long as the manager
+// leaves it waiting, and every answer this page has for a manager in trouble -
+// the error card, the retry, the log's own "the next one will do" - is written
+// for a promise that settles. So a manager that stopped answering mid-sentence
+// left the page shimmering at its own skeleton for as long as the window stayed
+// open, saying nothing, because nothing had failed.
+//
+// Generous on purpose. A cold /api/state walks the builds directory and asks
+// Docker, and a POST to /api/doctor probes the whole machine; this is not a
+// ceiling on how slow a working manager may be, it is the point past which one
+// is not working.
+const ANSWER_LIMIT_MS = 20000;
+
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-EngineShelf-Token': TOKEN,
-      ...(options.headers || {}),
-    },
-  });
-  if (!response.ok) {
-    const detail = await response.json().catch(() => ({}));
-    throw new Error(
-      detail.error || `${response.status} ${response.statusText}`,
-    );
+  const stop = new AbortController();
+  const bell = setTimeout(() => stop.abort(), ANSWER_LIMIT_MS);
+  try {
+    const response = await fetch(path, {
+      ...options,
+      signal: stop.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-EngineShelf-Token': TOKEN,
+        ...(options.headers || {}),
+      },
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(
+        detail.error || `${response.status} ${response.statusText}`,
+      );
+    }
+    // Inside the deadline as well: a body that stops halfway is the same
+    // silence as a request that was never answered at all.
+    return await response.json();
+  } catch (error) {
+    // What the browser throws for an abort says "signal is aborted without
+    // reason", which in an error card is worse than saying nothing.
+    if (error.name === 'AbortError') {
+      throw new Error(`no answer in ${Math.round(ANSWER_LIMIT_MS / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(bell);
   }
-  return response.json();
 }
 
 const post = (path, body) =>
@@ -4439,22 +4469,31 @@ function keepLooking() {
 }
 
 
+// One wording, because there are two places that can find out: the boot, with
+// nothing on screen yet but the skeleton, and every refresh after it. Both used
+// to be able to end in a shimmer that never resolved - the boot silently, and
+// showState is what puts the shimmer away.
+function sayNoAnswer(error, onAction) {
+  showState({
+    glyph: 'warn',
+    tone: 'error',
+    title: 'Cannot reach the manager',
+    detail:
+      `${error.message}. The local server is not answering — it was probably ` +
+      'stopped. Reopen EngineShelf, or start the manager from the project ' +
+      'folder: gui.ps1 on Windows, ./gui.sh on macOS and Linux.',
+    actionLabel: 'Try again',
+    onAction,
+  });
+}
+
 async function refresh() {
   let next;
   try {
     next = await api('/api/state');
   } catch (error) {
     keepLooking();
-    showState({
-      glyph: 'warn',
-      tone: 'error',
-      title: 'Cannot reach the manager',
-      detail:
-        `${error.message}. The local server is not answering — it was probably ` +
-        'stopped. Reopen EngineShelf, or run ./gui.sh from the project folder.',
-      actionLabel: 'Try again',
-      onAction: refresh,
-    });
+    sayNoAnswer(error, refresh);
     return;
   }
 
@@ -4539,7 +4578,18 @@ async function refresh() {
     },
   );
 
-  TOKEN = (await (await fetch('/api/token')).json()).token;
+  // Through api(), for its deadline: /api/token is answered before the token
+  // check on both managers, so the header it carries with nothing in it yet
+  // costs nothing. And nothing below this line runs until it answers - a
+  // manager that never answered this one left the window shimmering at an empty
+  // shelf, the splash long since dropped, with no word anywhere about why.
+  try {
+    TOKEN = (await api('/api/token')).token;
+  } catch (error) {
+    // showState puts the shimmer away itself - an error is an answer too.
+    sayNoAnswer(error, () => location.reload());
+    return;
+  }
 
   // Before the first paint, so no row is drawn twice - once blank and once with
   // its features. Not fatal if it fails: an older server has no such endpoint,

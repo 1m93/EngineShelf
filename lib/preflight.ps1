@@ -14,6 +14,141 @@
 
 function Test-Have { param([string]$Name) $null -ne (Get-Command $Name -ErrorAction SilentlyContinue) }
 
+# ---------- a question with an end to it ----------
+# Every docker and wsl call below asks something of a machine that can be
+# starting up, half-installed or wedged. Docker Desktop mid-launch answers
+# `docker info` in its own time; `wsl -u root -e ...` on a distro that is not up
+# yet boots the whole virtual machine first; a Docker Desktop whose backend has
+# fallen over answers nothing at all. `& docker info` waits for every one of
+# those for as long as they like, and there is no way to tell it not to.
+#
+# gui/server.ps1 asks these on the one thread it serves HTTP with, so an answer
+# that never arrives is not a slow system-check panel. It is a manager that has
+# stopped: the page shimmers at its own skeleton, no request is answered, and the
+# watchdog that would notice is frozen with everything else. Asked at startup -
+# Set-InheritedContainers - it is a manager that never opens a window at all, and
+# a `docker` stub that slept for five minutes did exactly that here.
+#
+# server.py cannot get into either state. Every docker call there goes through
+# docker_out(timeout=8), the volume read has 20, and the doctor is a child
+# process with timeout=25 - and it serves on threads, so a slow answer costs one
+# request rather than the manager. These are the same numbers, for the same
+# reasons, on the half that has one thread and needs them more.
+#
+# Not `& cmd` with something clever around it: there is nothing to put around it.
+# Not Start-Process either - this needs the exit code and the output, and both
+# pipes have to be drained while it runs or a chatty command fills one, blocks on
+# the write, and is then waited on by the very code that would have read it.
+$PfAskSeconds    = 8    # docker_out's own limit in server.py
+$PfVolumeSeconds = 20   # what server.py gives `system df -v`
+$PfWslSeconds    = 20   # this one may have to boot the distro before it answers
+$PfStopSeconds   = 90   # `docker stop -t 10` over however many containers
+$PfRemoveSeconds = 30
+
+# Set by Invoke-Bounded, never cleared by it: a caller that cares whether a "no"
+# was really a shrug resets this before asking and reads it after. Get-DockerRoute
+# is the one that must - see the note there.
+$script:PfTimedOut = $false
+
+# One report, one question each. Get-PfReport walks the components and then asks
+# every one of them for its status, its fix and its note, and all three come off
+# the same four probes: `docker info` ran twice for a single system check and
+# `wsl -l -q` three times. On a healthy machine that is seconds of the manager's
+# only thread; on a slow one it is the same wait several times over, and it is
+# what put a state poll past the twenty seconds the page waits.
+#
+# Alive only for the length of the piece of work that opened it, not on a timer.
+# Invoke-PfFix waits for a daemon it has just started by asking
+# Test-WslDockerRunning once a second for ninety seconds, and an answer
+# remembered from before it started would be a wait that can never end.
+#
+# Nested, because two pieces of work want it: Get-PfReport for one report, and
+# gui/server.ps1's Get-State for a whole state document - which builds the Docker
+# status and then a report, and used to ask `docker info` and `wsl -l -q` again
+# for the second half. The outermost caller owns it.
+$script:PfMemo = $null
+
+function Start-PfMemo {
+    if ($null -ne $script:PfMemo) { return $false }
+    $script:PfMemo = @{}
+    return $true
+}
+
+function Stop-PfMemo {
+    param([bool]$Mine)
+    if ($Mine) { $script:PfMemo = $null }
+}
+
+function Get-PfAnswer {
+    param([string]$Name, [scriptblock]$Ask)
+    if ($null -eq $script:PfMemo) { return (& $Ask) }
+    if ($script:PfMemo.ContainsKey($Name)) { return $script:PfMemo[$Name] }
+    $value = & $Ask
+    $script:PfMemo[$Name] = $value
+    return $value
+}
+
+function Invoke-Bounded {
+    param([string]$File, [string[]]$Arguments = @(), [int]$Seconds = 8)
+
+    $answer = @{ code = 127; out = ''; timedOut = $false }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $File
+    # Windows PowerShell has no ArgumentList on this object, only the one string,
+    # and Quote-Args is what the rest of this file already builds one with.
+    $psi.Arguments = ((Quote-Args $Arguments) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # And nothing on stdin, closed the moment it starts. A probe that finds
+    # itself asked a question - winget wanting its source agreements, sudo
+    # wanting a password - would otherwise wait for an answer that nobody is
+    # there to type. server.py hands every child stdin=DEVNULL for this reason.
+    $psi.RedirectStandardInput = $true
+
+    $proc = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        # Not on the machine at all. 127 is what a shell would have said, which
+        # is what every caller here already reads.
+        return $answer
+    }
+    try { $proc.StandardInput.Close() } catch { }
+
+    $out = $proc.StandardOutput.ReadToEndAsync()
+    $err = $proc.StandardError.ReadToEndAsync()
+
+    if (-not $proc.WaitForExit($Seconds * 1000)) {
+        $answer.timedOut = $true
+        $answer.code = 124    # what `timeout` exits with on the other half
+        $script:PfTimedOut = $true
+        try { $proc.Kill() } catch { }
+        try { [void]$proc.WaitForExit(2000) } catch { }
+        return $answer
+    }
+
+    $answer.code = $proc.ExitCode
+    # Waited on for a moment, not for as long as they like: a grandchild that
+    # inherited the pipe can hold it open after the process itself has gone -
+    # wsl.exe leaves one behind - and reading to the end would then be the wait
+    # this whole function exists to avoid.
+    $text = ''
+    try { if ($out.Wait(1000)) { $text = [string]$out.Result } } catch { }
+    try { if ($err.Wait(1000)) { $text += [string]$err.Result } } catch { }
+    $answer.out = $text
+    return $answer
+}
+
+# Output of one of these, as the lines a caller wanted in the first place.
+function Split-Lines {
+    param([string]$Text)
+    if (-not $Text) { return @() }
+    return @($Text -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+}
+
 # ---------- the Docker edition on Windows ----------
 # Windows has no colima, and Docker Desktop is the thing this tool has always
 # refused: over a gigabyte, admin rights, a reboot, and a licence that is only
@@ -37,8 +172,9 @@ function Test-Have { param([string]$Name) $null -ne (Get-Command $Name -ErrorAct
 # which is theirs to choose - nothing here installs it.
 function Test-WindowsDocker {
     if (-not (Test-Have docker)) { return $false }
-    docker info 2>&1 | Out-Null
-    return ($LASTEXITCODE -eq 0)
+    return Get-PfAnswer 'windows-docker' {
+        (Invoke-Bounded 'docker' @('info') $PfAskSeconds).code -eq 0
+    }
 }
 
 # Every wsl call in this file goes through here, and for the reason
@@ -78,20 +214,36 @@ function Invoke-WslHere {
 # not the executable.
 function Test-WslReady {
     if (-not (Test-Have wsl)) { return $false }
-    $found = Invoke-WslHere -l -q 2>$null
-    if ($LASTEXITCODE -ne 0) { return $false }
-    return ((@($found) -join '').Trim().Length -gt 0)
+    # Bounded like the rest, and it does not need the preference dance any more:
+    # a child process's stderr is a pipe to read, not an error record raised in
+    # this scope. The listing does not start a distro, so this is the cheap one.
+    return Get-PfAnswer 'wsl-ready' {
+        $found = Invoke-Bounded 'wsl' @('-l', '-q') $PfAskSeconds
+        if ($found.code -ne 0) { return $false }
+        return ($found.out.Trim().Length -gt 0)
+    }
 }
 
 # Inside the distro, as root - no sudo, so nothing to answer.
 function Invoke-Wsl {
     param([string]$Command)
-    $out = Invoke-WslHere -u root -e sh -lc $Command 2>&1
-    return @{ code = $LASTEXITCODE; out = (@($out) -join "`n") }
+    # $PfWslSeconds rather than $PfAskSeconds: on a machine whose distro is not
+    # running, this is the call that boots it, and a cold boot is tens of seconds
+    # of honest work rather than a hang.
+    $answer = Invoke-Bounded 'wsl' @('-u', 'root', '-e', 'sh', '-lc', $Command) $PfWslSeconds
+    return @{ code = $answer.code; out = $answer.out; timedOut = $answer.timedOut }
 }
 
-function Test-WslDocker { return (Invoke-Wsl 'command -v docker >/dev/null 2>&1').code -eq 0 }
-function Test-WslDockerRunning { return (Invoke-Wsl 'docker info >/dev/null 2>&1').code -eq 0 }
+function Test-WslDocker {
+    return Get-PfAnswer 'wsl-docker' {
+        (Invoke-Wsl 'command -v docker >/dev/null 2>&1').code -eq 0
+    }
+}
+function Test-WslDockerRunning {
+    return Get-PfAnswer 'wsl-docker-running' {
+        (Invoke-Wsl 'docker info >/dev/null 2>&1').code -eq 0
+    }
+}
 
 # ---------- where docker is, and how to reach it ----------
 # Two answers on Windows and everything downstream has to agree on which: the
@@ -108,13 +260,40 @@ function Test-WslDockerRunning { return (Invoke-Wsl 'docker info >/dev/null 2>&1
 # is running, and the same moment that drops the other caches drops this.
 $script:PfDockerRoute = $null
 
-function Clear-DockerRoute { $script:PfDockerRoute = $null }
+# When the question was last put to a machine that did not answer it. Held for
+# this long before asking again - the same window gui/server.ps1 holds the Docker
+# status for, because that is what this feeds.
+$script:PfRouteAskedAt = [datetime]::MinValue
+$PfRouteRetrySeconds = 10
+
+function Clear-DockerRoute {
+    $script:PfDockerRoute = $null
+    $script:PfRouteAskedAt = [datetime]::MinValue
+}
 
 function Get-DockerRoute {
     if ($null -ne $script:PfDockerRoute) { return $script:PfDockerRoute }
-    if (Test-WindowsDocker) { $script:PfDockerRoute = 'windows' }
-    elseif ((Test-WslReady) -and (Test-WslDocker)) { $script:PfDockerRoute = 'wsl' }
-    else { $script:PfDockerRoute = '' }
+    # Undecided, and asked again - but not by every caller in turn. One state
+    # build asks for the route half a dozen times over, and a probe chain each
+    # time is what a wedged Docker Desktop turned into a forty-second answer.
+    if (((Get-Date) - $script:PfRouteAskedAt).TotalSeconds -lt $PfRouteRetrySeconds) {
+        return ''
+    }
+    $script:PfTimedOut = $false
+    $route = ''
+    if (Test-WindowsDocker) { $route = 'windows' }
+    elseif ((Test-WslReady) -and (Test-WslDocker)) { $route = 'wsl' }
+    # A probe that ran out of time did not answer the question. Remembering ''
+    # for the life of the manager because Docker Desktop was slow to come up
+    # would shut the Docker half of every row until a job happened to end and
+    # clear this - so it stays undecided and is asked again. What stops that
+    # being a probe per request is the caching above it: gui/server.ps1 holds the
+    # Docker status for 10 seconds and the doctor report for 12.
+    if ($route -eq '' -and $script:PfTimedOut) {
+        $script:PfRouteAskedAt = Get-Date
+        return ''
+    }
+    $script:PfDockerRoute = $route
     return $script:PfDockerRoute
 }
 
@@ -174,6 +353,28 @@ function Invoke-DockerHere {
         }
     } finally {
         $ErrorActionPreference = $was
+    }
+}
+
+# Docker, wherever docker is, for a question somebody is waiting on an answer
+# to: the manager reading back what images and containers exist, and what a
+# volume costs. Bounded, unlike Invoke-DockerHere, which stays exactly as it is -
+# `docker build` on a WebKit image is ten minutes of work and capping that would
+# be its own bug. The two are the same route decision either way, so a machine
+# cannot have the manager reading one daemon while the launcher builds on
+# another.
+function Invoke-DockerAsk {
+    param([string[]]$Arguments = @(), [int]$Seconds = 0)
+    if ($Seconds -le 0) { $Seconds = $PfAskSeconds }
+    switch (Get-DockerRoute) {
+        'windows' { return Invoke-Bounded 'docker' $Arguments $Seconds }
+        'wsl'     { return Invoke-Bounded 'wsl' (@('-u', 'root', '-e', 'docker') + $Arguments) $Seconds }
+        default {
+            # Nothing to run it with. 127 is what the passthrough leaves in
+            # $LASTEXITCODE for the same case, and what every caller reads as
+            # "docker did not answer".
+            return @{ code = 127; out = ''; timedOut = $false }
+        }
     }
 }
 
@@ -319,13 +520,21 @@ function Get-PfNote {
 $PfComponents = @('curl', 'unzip', 'python3', 'rosetta', 'wsl', 'docker')
 
 function Get-PfReport {
-    $components = foreach ($id in $PfComponents) {
-        $status = Get-PfStatus $id
-        [ordered]@{
-            id = $id; label = (Get-PfLabel $id); status = $status
-            need = (Get-PfNeed $id); why = (Get-PfWhy $id)
-            fix = (Get-PfFix $id $status); note = (Get-PfNote $id $status)
+    # For the length of this call, unless the caller already opened one: within
+    # one report the machine cannot have changed, and asking it the same question
+    # five times is five times the wait.
+    $mine = Start-PfMemo
+    try {
+        $components = foreach ($id in $PfComponents) {
+            $status = Get-PfStatus $id
+            [ordered]@{
+                id = $id; label = (Get-PfLabel $id); status = $status
+                need = (Get-PfNeed $id); why = (Get-PfWhy $id)
+                fix = (Get-PfFix $id $status); note = (Get-PfNote $id $status)
+            }
         }
+    } finally {
+        Stop-PfMemo $mine
     }
     return [ordered]@{
         os = 'windows'

@@ -162,9 +162,9 @@ function Get-DockerVolumeSizes {
     }
     $sizes = @{}
     try {
-        $raw = Invoke-DockerHere system df -v --format '{{json .Volumes}}' 2>$null
-        if ($LASTEXITCODE -eq 0 -and $raw) {
-            foreach ($volume in (@($raw) -join '' | ConvertFrom-Json)) {
+        $raw = Invoke-DockerAsk @('system', 'df', '-v', '--format', '{{json .Volumes}}') $PfVolumeSeconds
+        if ($raw.code -eq 0 -and $raw.out.Trim()) {
+            foreach ($volume in ($raw.out | ConvertFrom-Json)) {
                 if ($volume.Name -like "$VolumePrefix*") {
                     $sizes[$volume.Name.Substring($VolumePrefix.Length)] = Convert-HumanBytes $volume.Size
                 }
@@ -198,8 +198,7 @@ function Get-DockerStatus {
     $containers = @()
     $byRevision = @{}
     if ($hasCli) {
-        Invoke-DockerHere info 2>&1 | Out-Null
-        $running = ($LASTEXITCODE -eq 0)
+        $running = (Invoke-DockerAsk @('info')).code -eq 0
     }
 
     function Get-Slot {
@@ -221,7 +220,7 @@ function Get-DockerStatus {
         # images` and `docker system df` both said 1.49 GB and 1.96 GB. A gauge
         # that exists to show what is filling the disk cannot be off by four
         # times, so a rounded true number beats an exact wrong one.
-        $rows = @(Invoke-DockerHere images $ImageRepo --format '{{.Tag}}|{{.Size}}' 2>$null)
+        $rows = @(Split-Lines (Invoke-DockerAsk @('images', $ImageRepo, '--format', '{{.Tag}}|{{.Size}}')).out)
         foreach ($row in $rows) {
             $parts = $row -split '\|'
             if ($parts.Count -lt 2 -or -not $parts[0] -or $parts[0] -eq '<none>') { continue }
@@ -232,8 +231,8 @@ function Get-DockerStatus {
         # One container per version, named engineshelf-<revision>. Stopped
         # ones are listed too: a container that exits the moment it starts is a
         # fault worth showing, not a row that quietly does nothing.
-        $listing = @(Invoke-DockerHere ps -a --filter "name=$ContainerPrefix" `
-                     --format '{{.Names}}|{{.State}}|{{.Status}}|{{.Ports}}' 2>$null)
+        $listing = @(Split-Lines (Invoke-DockerAsk @('ps', '-a', '--filter', "name=$ContainerPrefix",
+                     '--format', '{{.Names}}|{{.State}}|{{.Status}}|{{.Ports}}')).out)
         foreach ($line in $listing) {
             $parts = $line -split '\|'
             if ($parts.Count -lt 4 -or $parts[0] -notlike "$ContainerPrefix*") { continue }
@@ -684,6 +683,23 @@ function Get-ShelfRow {
 }
 
 function Get-State {
+    # One state document asks the machine the same few questions twice over: the
+    # Docker status wants to know where docker is, and the doctor report below
+    # wants to know all over again for its own rows. Every one of those is a
+    # child process with a time limit now, and on a machine that is slow to
+    # answer they added up - a wedged Docker Desktop made this a 32-second
+    # answer, which is past the twenty the page waits before it says the manager
+    # has stopped. Held for the length of this build; nothing here can change
+    # between the two halves of it.
+    $mine = Start-PfMemo
+    try {
+        return Build-State
+    } finally {
+        Stop-PfMemo $mine
+    }
+}
+
+function Build-State {
     $cat = Read-Catalog
     $docker = Get-DockerStatus
     # Keyed by directory name rather than by revision, which is what lets one
@@ -1570,7 +1586,12 @@ function Get-RunningContainers {
     # catch. This runs at startup (Set-InheritedContainers) before anything is
     # wrapped in a request handler, so an unguarded call takes the manager down.
     if ((Get-DockerRoute) -eq '') { return @() }
-    return @(Invoke-DockerHere ps --filter "name=$ContainerPrefix" --format '{{.Names}}' 2>$null |
+    # Bounded, like every other question put to docker here. This one is asked
+    # before the loop is even serving, so a docker that never answers used to be
+    # a manager that never opened its window - a `docker` that slept for five
+    # minutes never got as far as printing the address.
+    return @(Split-Lines (Invoke-DockerAsk @('ps', '--filter', "name=$ContainerPrefix",
+                          '--format', '{{.Names}}')).out |
              Where-Object { $_ -like "$ContainerPrefix*" })
 }
 
@@ -1599,8 +1620,11 @@ function Stop-Containers {
     if (-not $names.Count) { return }
     $plural = if ($names.Count -gt 1) { 's' } else { '' }
     Write-Host "  Stopping $($names.Count) Docker container$plural..."
-    Invoke-DockerHere stop -t 10 @names 2>&1 | Out-Null
-    Invoke-DockerHere rm -f @names 2>&1 | Out-Null
+    # server.py's own limits for these two: long enough for -t 10 over several
+    # containers, and a manager that cannot exit because `docker stop` will not
+    # answer is a window that has closed with the process still holding the port.
+    Invoke-DockerAsk (@('stop', '-t', '10') + $names) $PfStopSeconds | Out-Null
+    Invoke-DockerAsk (@('rm', '-f') + $names) $PfRemoveSeconds | Out-Null
 }
 
 function Clear-CutOff {
@@ -1967,6 +1991,138 @@ if (-not $New) {
     }
 }
 
+# ---------- accepting ----------
+#
+# A connection is not a request, and this loop is the only thread there is.
+#
+# A browser opens more sockets than it sends requests on: one per parallel fetch,
+# the spare it opens when the first is slow to answer, and the one it preconnects
+# for what it thinks is coming next. Every answer here carries Connection: close,
+# so every poll the page makes is a socket of its own and there are always more
+# of them about than there are requests in flight. Reading from one that has not
+# spoken yet blocks until it does - and with one thread, that is the manager
+# answering nothing at all until the browser gets round to closing it. The page
+# got its HTML, its CSS and its script, and then sat on the skeleton for ever
+# because /api/token was never answered: nothing in the window, nothing in a log,
+# and the watchdog below frozen with the rest of it.
+#
+# server.py cannot get into this state - ThreadingHTTPServer gives every
+# connection a thread of its own. Here the sockets wait in a list instead and are
+# only read from once they have bytes waiting, which is the same promise one
+# thread can keep.
+
+$script:Waiting = New-Object System.Collections.ArrayList
+
+# Assigned here as well as in the loop: a name nothing has assigned is $null
+# rather than an error, and $null is false, which is a loop that sleeps through
+# every request it just answered.
+$script:ServedAny = $false
+
+# How long a socket may say nothing before it is taken to be a spare. Longer than
+# any answer here takes, so a socket held open behind a slow one of ours is never
+# thrown away; short enough that a browser's spares do not collect.
+$WaitingSeconds = 30
+
+# A page in someone's own browser can open sockets as fast as it likes, and the
+# token gate is no help - opening one costs nothing and needs nothing. The oldest
+# silent socket goes rather than the list growing without end.
+$WaitingMost = 64
+
+function Close-Client {
+    param($Client, $Stream)
+    if ($Stream) { try { $Stream.Close() } catch { } }
+    if ($Client) { try { $Client.Close() } catch { } }
+}
+
+function Add-Waiting {
+    param($Listener)
+    while ($Listener.Pending()) {
+        $client = $null
+        try {
+            $client = $Listener.AcceptTcpClient()
+            # A request that starts to arrive and stops halfway must not hold the
+            # loop either, and neither must a client that stops reading in the
+            # middle of 200 KB of app.js: both used to be a wait with no end to
+            # it. Read-Request and Send-Response throw on these instead.
+            $client.ReceiveTimeout = 5000
+            $client.SendTimeout = 15000
+            [void]$script:Waiting.Add(@{ client = $client; at = (Get-Date) })
+        } catch {
+            # A socket that died between the accept and here is this socket's
+            # problem. Out of this function it would be the manager's - see
+            # Invoke-Served.
+            Close-Client $client
+        }
+        while ($script:Waiting.Count -gt $WaitingMost) {
+            $oldest = $script:Waiting[0]
+            $script:Waiting.RemoveAt(0)
+            Close-Client $oldest.client
+        }
+    }
+}
+
+# Has this socket said anything yet? $true is bytes waiting, $false is not yet,
+# and $null is gone - which is not the same question twice. Poll only says a read
+# would not block, and that is true both of a socket with a request on it and of
+# one whose other end has hung up; Available is what tells those apart, and on a
+# connection the peer reset it throws rather than answering 0. All three are
+# ordinary things for a browser's spare socket to do.
+function Test-Talking {
+    param($Client)
+    try {
+        if (-not $Client.Client.Poll(0, [Net.Sockets.SelectMode]::SelectRead)) { return $false }
+        if ($Client.Available -le 0) { return $null }
+        return $true
+    } catch {
+        return $null
+    }
+}
+
+# One request, start to finish. Nothing thrown in here leaves it: the loop that
+# calls this has the manager's whole shutdown in its finally, so an exception
+# getting out is not a failed request, it is EngineShelf closing - browsers,
+# containers and all - because a browser reset a socket.
+function Invoke-Served {
+    param($Client)
+    $stream = $null
+    try {
+        $stream = $Client.GetStream()
+        $request = Read-Request $stream
+        if ($request) { Invoke-Route $stream $request | Out-Null }
+    } catch {
+        try { Send-Json $stream @{ error = $_.Exception.Message } 400 } catch { }
+    } finally {
+        Close-Client $Client $stream
+    }
+}
+
+# One pass over the sockets accepted so far: what has spoken gets answered, what
+# has gone or has been silent too long is dropped, and what is merely still
+# sitting there is left for the next pass. Sets $script:ServedAny rather than
+# returning a count - the caller only wants to know whether to sleep, and a
+# return value would be at the mercy of anything downstream writing to the
+# pipeline.
+function Invoke-Waiting {
+    # A copy: a socket leaves the list while the list is being walked.
+    foreach ($entry in @($script:Waiting)) {
+        $client = $entry.client
+        $talking = Test-Talking $client
+        if ($null -eq $talking) {
+            $script:Waiting.Remove($entry)
+            Close-Client $client
+        } elseif (-not $talking) {
+            if (((Get-Date) - $entry.at).TotalSeconds -gt $WaitingSeconds) {
+                $script:Waiting.Remove($entry)
+                Close-Client $client
+            }
+        } else {
+            $script:Waiting.Remove($entry)
+            $script:ServedAny = $true
+            Invoke-Served $client
+        }
+    }
+}
+
 # ---------- serve ----------
 $listener = $null
 for ($candidate = $Port; $candidate -lt $Port + 40; $candidate++) {
@@ -2034,12 +2190,15 @@ Write-Host ""
 # from the shipped catalog while it runs. The next refresh picks up what it found.
 Update-CatalogCache
 
-# Pending() instead of a blocking accept, so the watchdog below gets a turn: this
-# loop is the only thread there is.
+# Never a blocking accept and never a blocking read: the watchdog below, and
+# every other socket, has to get a turn.
 $lastTick = Get-Date
 try {
     while (-not $script:QuitReason) {
-        if (-not $listener.Pending()) {
+        $script:ServedAny = $false
+        Add-Waiting $listener
+        Invoke-Waiting | Out-Null
+        if (-not $script:ServedAny) {
             Start-Sleep -Milliseconds 120
             $now = Get-Date
             if (($now - $lastTick).TotalSeconds -lt 1) { continue }
@@ -2067,22 +2226,14 @@ try {
                 # its own window opened would be a fine joke.
                 $script:QuitReason = 'the manager page stopped answering'
             }
-            continue
-        }
-        $client = $listener.AcceptTcpClient()
-        $stream = $client.GetStream()
-        try {
-            $request = Read-Request $stream
-            if ($request) { Invoke-Route $stream $request }
-        } catch {
-            try { Send-Json $stream @{ error = $_.Exception.Message } 400 } catch { }
-        } finally {
-            $stream.Close()
-            $client.Close()
         }
     }
 } finally {
     $listener.Stop()
+    # Whatever was still holding a socket hears it now, rather than at the end of
+    # Stop-Everything - stopping containers is not instant.
+    foreach ($entry in @($script:Waiting)) { Close-Client $entry.client }
+    $script:Waiting.Clear()
     if (-not $script:QuitReason) { $script:QuitReason = 'Ctrl-C' }
     Write-Host ""
     Write-Host "  Closing ($script:QuitReason)."

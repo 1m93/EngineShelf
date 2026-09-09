@@ -18,6 +18,7 @@
 #   cli      the download meter, and the refresh that asks the vendors
 #   preflight the WSL 2 -> Docker chain, every state a machine can be in
 #   webkit   which Ubuntu image a container is built from, per revision
+#   serving  a socket that says nothing does not stop the one thread
 #
 [CmdletBinding()]
 param(
@@ -29,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$suites = @('streams', 'routes', 'caches', 'cli', 'preflight', 'webkit')
+$suites = @('streams', 'routes', 'caches', 'cli', 'preflight', 'webkit', 'serving')
 $failed = @()
 
 # First, and cheapest: a name nothing assigns is $null here rather than an error,

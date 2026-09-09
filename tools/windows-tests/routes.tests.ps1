@@ -11,21 +11,21 @@ $ErrorActionPreference = 'Stop'
 
 $LiftFrom = @('./gui/server.ps1', './lib/preflight.ps1')
 $LiftFunctions = @(
-    'Invoke-Route', 'Get-State', 'Get-Body', 'Get-Field', 'Read-JobFile',
+    'Invoke-Route', 'Get-State', 'Build-State', 'Get-Body', 'Get-Field', 'Read-JobFile',
     'Get-StreamKey', 'Get-StreamLabel', 'Resolve-Stream', 'Get-StreamUpdated',
     'Remove-IdleStreams', 'Get-JobState', 'Get-JobBrief', 'Get-JobSummary',
     'Split-JobText', 'Test-MeterLine', 'Get-JobLines', 'Get-StreamJobs',
     'Get-StreamRunning', 'Get-StreamLatest', 'Get-StreamLog', 'Get-StreamList',
     'Get-JobRecord', 'Clear-SizeCache', 'Clear-DoctorCache', 'Get-DirSize',
     'Test-NativeStale', 'Start-NativeRefresh', 'Quote-Args',
-    'Clear-DockerRoute', 'Get-DockerRoute'
+    'Clear-DockerRoute', 'Get-DockerRoute', 'Start-PfMemo', 'Stop-PfMemo'
 )
 $LiftInspect = @('Start-Job2')
 $LiftVariables = @(
     'StreamLines', 'StreamMax', 'StreamRule', 'StreamDot', 'StreamPattern',
     'Streams', 'SizeCache', 'SizeTtlSeconds', 'DoctorCache', 'DockerCache',
     'VolumeCache', 'NativeTtl', 'NativeRetrySeconds', 'NativeAsked',
-    'PfDockerRoute'
+    'PfDockerRoute', 'PfMemo'
 )
 . "$PSScriptRoot/harness.ps1"
 
