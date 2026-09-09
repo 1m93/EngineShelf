@@ -54,6 +54,61 @@ New-Item -ItemType Directory -Force -Path $JobsDir | Out-Null
 
 $HostPlatform = 'Win_x64'
 
+# ---------- children ----------
+#
+# Every child the manager starts is one of our own scripts run by another
+# powershell.exe, and this file held three copies of that command line. One copy
+# now, because the shape of the command line is itself the liability:
+# powershell.exe launched with -ExecutionPolicy Bypass into a window nobody can
+# see is what a dropper looks like, and Windows Defender reads a .ps1 through
+# AMSI before a line of it runs. On a 1.1.8 install it refused gui\server.ps1
+# outright - a parse error pointing at line 1 of a file whose line 1 is
+# [CmdletBinding()], with nothing of ours having run to explain it, and
+# "Press any key to continue" under it. server.py starts its children with
+# subprocess.Popen and has never had either question put to it.
+#
+# -NoNewWindow, rather than asking for a window and then hiding it. It is the
+# same absence of a window here - all three of a child's streams go to files, so a console of its
+# own would have nothing to show - and it is not the token every scanner is
+# looking for. -ExecutionPolicy Bypass stays: the child is a new powershell.exe,
+# the default policy on Windows client is Restricted, and dropping it would mean
+# no job runs at all on a machine nobody has told otherwise.
+#
+# The three files are made here rather than left to the redirection to make, and
+# made truly empty rather than with Set-Content, which would put a newline in
+# each: the log is rendered from them, so every run would open with a blank line
+# the other platforms do not have. Stdin is one of the three because a job gets
+# nothing on stdin - that is what server.py's stdin=subprocess.DEVNULL is - and
+# an inherited stdin that never answers is a job that never ends: winget waiting
+# on its source agreements, sudo waiting on a password inside WSL. An empty file
+# rather than NUL, because it is a real handle that reads end-of-file on any
+# Windows and the job directory is already ours.
+function Start-Child {
+    param(
+        [Parameter(Mandatory = $true)][string]$Script,
+        [string[]]$CliArgs = @(),
+        [Parameter(Mandatory = $true)][string]$StdIn,
+        [Parameter(Mandatory = $true)][string]$StdOut,
+        [Parameter(Mandatory = $true)][string]$StdErr,
+        [switch]$PassThru
+    )
+    [IO.File]::WriteAllText($StdOut, '')
+    [IO.File]::WriteAllText($StdErr, '')
+    [IO.File]::WriteAllText($StdIn, '')
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Script) + $CliArgs
+    $opts = [ordered]@{
+        FilePath               = 'powershell.exe'
+        ArgumentList           = (Quote-Args $psArgs)
+        WorkingDirectory       = $Project
+        NoNewWindow            = $true
+        RedirectStandardInput  = $StdIn
+        RedirectStandardOutput = $StdOut
+        RedirectStandardError  = $StdErr
+    }
+    if ($PassThru) { $opts['PassThru'] = $true }
+    return Start-Process @opts
+}
+
 # ---------- catalog ----------
 # Same precedence the CLI uses: the shipped catalog, then the runtime cache over
 # the top of it. catalog.tsv freezes at the release; the cache holds whatever has
@@ -93,9 +148,12 @@ function Read-Catalog {
 # archive. Failure is silent - the shipped catalog is still a complete answer.
 function Update-CatalogCache {
     try {
-        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden `
-            -ArgumentList (Quote-Args @('-NoProfile', '-ExecutionPolicy', 'Bypass',
-                                        '-File', $script:Cli, 'catalog')) | Out-Null
+        # A fixed name rather than a job number: this is not a job, nothing reads
+        # its log, and it is started once, at the bottom of this file.
+        Start-Child -Script $script:Cli -CliArgs @('catalog') `
+            -StdIn  (Join-Path $JobsDir 'catalog.in') `
+            -StdOut (Join-Path $JobsDir 'catalog.out') `
+            -StdErr (Join-Path $JobsDir 'catalog.err') | Out-Null
     } catch { }
 }
 
@@ -331,9 +389,14 @@ function Start-NativeRefresh {
     if ($stale.Count -eq 0) { return }
     $script:NativeAsked = Get-Date
     try {
-        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList (
-            Quote-Args (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                          $script:Cli, 'refresh-native') + $stale)) | Out-Null
+        # Fixed names again, and safe for the same reason the catalog child's are:
+        # one of these at a time, $NativeRetrySeconds apart. Two overlapping would
+        # collide on the file and land in the catch below, which costs one refresh
+        # and nothing else - the next poll asks again.
+        Start-Child -Script $script:Cli -CliArgs (@('refresh-native') + $stale) `
+            -StdIn  (Join-Path $JobsDir 'native.in') `
+            -StdOut (Join-Path $JobsDir 'native.out') `
+            -StdErr (Join-Path $JobsDir 'native.err') | Out-Null
     } catch { }
 }
 
@@ -971,26 +1034,10 @@ function Start-Job2 {
     $out = Join-Path $JobsDir "$id.out"
     $err = Join-Path $JobsDir "$id.err"
     $in  = Join-Path $JobsDir "$id.in"
-    # Truly empty, not an empty line: Set-Content would put a newline in each
-    # file, and the log is rendered from them - so every run would open with a
-    # blank line the other platforms do not have.
-    [IO.File]::WriteAllText($out, '')
-    [IO.File]::WriteAllText($err, '')
-    [IO.File]::WriteAllText($in, '')
-
-    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Script) + $CliArgs
-    # Nothing on the other end of stdin, which is what server.py gives every job
-    # with stdin=subprocess.DEVNULL. Without it the child inherits the manager's,
-    # and anything that asks a question waits for an answer that cannot arrive:
-    # winget wanting its source agreements accepted, sudo wanting a password
-    # inside WSL. The job never ends, prints nothing after the question, and only
-    # does it on Windows - which is how it went unnoticed. An empty file rather
-    # than NUL: it is a real handle that reads EOF on any Windows, and the job
-    # directory is already ours.
-    $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList (Quote-Args $psArgs) `
-        -WorkingDirectory $Project -PassThru -WindowStyle Hidden `
-        -RedirectStandardInput $in `
-        -RedirectStandardOutput $out -RedirectStandardError $err
+    # Start-Child makes all three, empty, and hands the child nothing but them -
+    # stdin included. Why each of those matters is written down there.
+    $proc = Start-Child -Script $Script -CliArgs $CliArgs `
+        -StdIn $in -StdOut $out -StdErr $err -PassThru
 
     $script:Jobs[$id] = @{
         id = $id; kind = $Kind; revision = $Revision; label = $Label

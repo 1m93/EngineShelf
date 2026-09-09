@@ -240,9 +240,13 @@ for (const [name, src, open, jobKey, streamKey] of [
 // DEVNULL and always did. PowerShell inherits unless told otherwise, so a
 // dependency install sat at "installing..." for ever - on Windows only, which is
 // why nothing caught it.
+//
+// Written without the leading dash because the redirection is set by name in the
+// hashtable Start-Child splats, not as a flag on a call - which is also why the
+// check below can be as strict as it is.
 const stdinDenied = [
   ['server.py', /stdin=subprocess\.DEVNULL/.test(PY)],
-  ['server.ps1', /-RedirectStandardInput/.test(PS)],
+  ['server.ps1', /RedirectStandardInput/.test(PS)],
 ];
 const leaky = stdinDenied.filter(([, ok]) => !ok).map(([name]) => name);
 if (leaky.length) {
@@ -251,6 +255,24 @@ if (leaky.length) {
     'Anything the child asks will hang it: winget agreements, sudo in WSL.',
   ]);
 } else pass('a job is given no stdin', 'both managers');
+
+// ---------- 4bb. one place that starts a powershell child ----------
+// There were three, with the same command line copied into each: the catalog
+// refresh, the native-availability refresh, and every job. Windows Defender read
+// that command line - powershell.exe, -ExecutionPolicy Bypass, a window nobody
+// can see - through AMSI and refused to load gui/server.ps1 at all on a 1.1.8
+// install, before a line of ours had run. Whatever the answer to that turns out
+// to be, it has to be the answer in one place: a fourth copy is a fourth thing
+// to fix, and the copy that gets missed is the feature that quietly stops
+// working on the half nobody here runs. Start-Child is that place.
+const spawners = (PS.match(/'powershell\.exe'/g) || []).length;
+if (spawners !== 1) {
+  fail('one place starts a powershell child', [
+    `server.ps1 names powershell.exe ${spawners} times, not once`,
+    'Route it through Start-Child, which is where stdin, the window and the',
+    'execution policy are decided for every child the manager starts.',
+  ]);
+} else pass('one place starts a powershell child', 'Start-Child');
 
 // ---------- 4c. arguments with spaces in them ----------
 // Python hands subprocess a list, and a list is the argument vector - a path with

@@ -10,7 +10,7 @@ $LiftFunctions = @(
     'Get-DirSize', 'Clear-SizeCache', 'Get-DoctorReport', 'Clear-DoctorCache',
     'Get-JobState', 'Get-JobBrief', 'Test-NativeStale', 'Start-NativeRefresh',
     'Test-MeterLine', 'Split-JobText', 'Get-JobLines', 'Read-JobFile',
-    'Quote-Args', 'Clear-DockerRoute', 'Get-DockerRoute'
+    'Quote-Args', 'Clear-DockerRoute', 'Get-DockerRoute', 'Start-Child'
 )
 $LiftVariables = @(
     'SizeCache', 'SizeTtlSeconds', 'DoctorCache', 'DoctorTtlSeconds',
@@ -40,6 +40,11 @@ class FakeProc {
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("es-cache-test-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+# Start-Child writes the three stream files before it spawns anything, so the
+# real one needs somewhere real to write them.
+$JobsDir = $work
+$Project = $work
 
 Write-Host ''
 Write-Host 'the size cache'
@@ -163,7 +168,14 @@ Start-NativeRefresh $null
 Test-That 'one child, not one per answer' $script:spawned.Count 1
 $argv = @($script:spawned[0] | ForEach-Object { $_ }) -join ' '
 Test-That 'runs the CLI command' ($argv -match 'refresh-native webkit versions') $true
-Test-That 'hidden' ($argv -match 'Hidden') $true
+# No window rather than a hidden one, and nothing on stdin. -WindowStyle Hidden
+# is half of what Defender reads as a dropper; the other half, -ExecutionPolicy
+# Bypass, is load-bearing and stays.
+Test-That 'in no window of its own' ($argv -match 'NoNewWindow') $true
+Test-That 'and not a hidden one' ($argv -match 'Hidden') $false
+Test-That 'nothing on its stdin' ($argv -match 'RedirectStandardInput') $true
+Test-That 'the stdin it gets is empty' `
+    ([IO.File]::ReadAllText((Join-Path $JobsDir 'native.in'))) ''
 
 Start-NativeRefresh $null
 Test-That 'not again inside the retry window' $script:spawned.Count 1
@@ -173,7 +185,11 @@ $script:NativeAsked = [datetime]::MinValue
 $script:spawned = @()
 Start-NativeRefresh $fresh
 $argv = @($script:spawned[0] | ForEach-Object { $_ }) -join ' '
-Test-That 'only what is stale is asked for' ($argv -match 'refresh-native versions$') $true
+# Not anchored on the end of the line any more: the child's arguments are no
+# longer the last thing Start-Process is handed. What is being asked is that
+# webkit, which has an answer on file, is not asked for again.
+Test-That 'only what is stale is asked for' ($argv -match 'refresh-native versions\b') $true
+Test-That 'and webkit is not asked for at all' ($argv -match 'webkit') $false
 
 $script:NativeAsked = [datetime]::MinValue
 $script:spawned = @()

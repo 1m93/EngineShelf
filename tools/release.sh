@@ -4,6 +4,7 @@
 #
 #   tools/release.sh                 # build every artifact this machine can
 #   tools/release.sh --no-obfuscate  # readable source (for debugging a release)
+#   tools/release.sh --ps-strip      # strip comments from PowerShell (see note)
 #   tools/release.sh --ps-heavy      # heavy-obfuscate PowerShell too (see note)
 #   tools/release.sh --version 2.1   # stamp a version into the artifact names
 #
@@ -14,9 +15,11 @@
 #   SHA256SUMS.txt                   checksums for every artifact above
 #
 # Obfuscation is deterrence, not protection - see tools/obfuscate.sh. bash and
-# Python are wrapped and TESTED on this machine. PowerShell defaults to a safe
-# comment-strip; --ps-heavy switches to an encoded wrapper that is written but
-# UNTESTED here (no pwsh), so verify it on Windows before shipping.
+# Python are wrapped and TESTED on this machine. PowerShell is shipped verbatim:
+# the file Windows Defender scans through AMSI is this one, not the repo's, and
+# a stripped .ps1 is a denser file with none of its own prose left to explain
+# what it does. --ps-strip puts the comment strip back, --ps-heavy switches to an
+# encoded wrapper that is written but UNTESTED here (no pwsh).
 #
 set -euo pipefail
 
@@ -26,11 +29,13 @@ DIST="$ROOT/dist"
 source "$ROOT/tools/obfuscate.sh"
 
 OBFUSCATE=1
+PS_STRIP=0
 PS_HEAVY=0
 VERSION=""
 for arg in "$@"; do
   case "$arg" in
     --no-obfuscate) OBFUSCATE=0 ;;
+    --ps-strip)     PS_STRIP=1 ;;
     --ps-heavy)     PS_HEAVY=1 ;;
     --version)      : ;;                 # handled below
     *)              if [ "${PREV:-}" = "--version" ]; then VERSION="$arg"; fi ;;
@@ -53,11 +58,18 @@ step() { printf '\n== %s ==\n' "$*"; }
 
 # gzip+base64 encoded PowerShell is the single strongest antivirus trigger on
 # Windows: Defender/AMSI flag base64-encoded scriptblocks as a malware signature.
-# The light (comment-strip) default ships readable, unflagged PowerShell - keep
-# it that way for anything the public downloads.
+# The comment strip is milder and was the default for a long time, and 1.1.8 -
+# built with it - is the release that got refused as malicious on a user's
+# machine. Neither is worth anything against a determined reader of an
+# interpreted script, and both cost the shipped file the prose that says what it
+# is. Verbatim is the default now; these two warn because a release build is not
+# where either belongs.
 if [ "$PS_HEAVY" = "1" ]; then
   printf '\n  !! --ps-heavy encodes PowerShell as base64 - Windows Defender/SmartScreen\n' >&2
   printf '     flag this pattern heavily. Do NOT use it for public release builds.\n\n' >&2
+elif [ "$PS_STRIP" = "1" ]; then
+  printf '\n  !! --ps-strip ships PowerShell with its comments removed. That is the\n' >&2
+  printf '     build 1.1.8 shipped, and Defender refused gui/server.ps1 on it.\n\n' >&2
 fi
 
 # --------------------------------------------------------------------------- #
@@ -119,20 +131,25 @@ stage_tree() {
     obf_py   "$dest/gui/server.py"
     say "obfuscated: 5 bash + 1 python + 3 web assets"
   else
-    local fn=obf_ps1_light label="light (comment strip)"
+    # PowerShell goes out as it is unless asked otherwise - see the note above
+    # the warnings near the top of this file.
+    local fn="" label="verbatim"
+    [ "$PS_STRIP" = "1" ] && { fn=obf_ps1_light; label="light (comment strip)"; }
     [ "$PS_HEAVY" = "1" ] && { fn=obf_ps1_heavy; label="heavy (encoded, UNTESTED here)"; }
-    "$fn" "$dest/engineshelf.ps1"
-    "$fn" "$dest/engineshelf-docker.ps1"
-    "$fn" "$dest/gui.ps1"
-    "$fn" "$dest/lib/preflight.ps1"
-    "$fn" "$dest/lib/engines.ps1"
-    "$fn" "$dest/gui/server.ps1"
+    if [ -n "$fn" ]; then
+      "$fn" "$dest/engineshelf.ps1"
+      "$fn" "$dest/engineshelf-docker.ps1"
+      "$fn" "$dest/gui.ps1"
+      "$fn" "$dest/lib/preflight.ps1"
+      "$fn" "$dest/lib/engines.ps1"
+      "$fn" "$dest/gui/server.ps1"
+    fi
     say "obfuscated: 6 powershell [$label] + 3 web assets"
   fi
 }
 
 # --------------------------------------------------------------------------- #
-step "EngineShelf release  (version $VERSION, obfuscate=$OBFUSCATE ps-heavy=$PS_HEAVY)"
+step "EngineShelf release  (version $VERSION, obfuscate=$OBFUSCATE ps-strip=$PS_STRIP ps-heavy=$PS_HEAVY)"
 rm -rf "$DIST"; mkdir -p "$DIST"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
@@ -242,6 +259,20 @@ EngineShelf - how to open (Windows)
 
 Want a Desktop / Start Menu icon?
   Right-click Create-Shortcut.ps1 -> Run with PowerShell (once).
+
+Antivirus says "this script contains malicious content"?
+  It is a false positive, and EngineShelf.bat will now say so and tell you
+  this instead of showing you a wall of red. The manager opens a port on
+  127.0.0.1 and starts PowerShell children, which is most of what a backdoor
+  does, so a scanner can read it the wrong way. To allow it, in PowerShell
+  as Administrator:
+
+      Add-MpPreference -ExclusionPath "<this folder>\app"
+
+  Or report it at https://www.microsoft.com/wdsi/filesubmission. The command
+  line does not go through the manager and may run as it is:
+
+      app\engineshelf.ps1 run 74
 
 Windows warns about the download?
   EngineShelf.bat is a short, readable script - open it in Notepad - that

@@ -18,7 +18,8 @@ $LiftFunctions = @(
     'Get-StreamRunning', 'Get-StreamLatest', 'Get-StreamLog', 'Get-StreamList',
     'Get-JobRecord', 'Clear-SizeCache', 'Clear-DoctorCache', 'Get-DirSize',
     'Test-NativeStale', 'Start-NativeRefresh', 'Quote-Args',
-    'Clear-DockerRoute', 'Get-DockerRoute', 'Start-PfMemo', 'Stop-PfMemo'
+    'Clear-DockerRoute', 'Get-DockerRoute', 'Start-PfMemo', 'Stop-PfMemo',
+    'Start-Child'
 )
 $LiftInspect = @('Start-Job2')
 $LiftVariables = @(
@@ -45,6 +46,7 @@ $script:next = 1
 
 $JobsDir = Join-Path ([IO.Path]::GetTempPath()) ("es-route-test-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $JobsDir | Out-Null
+$Project = $JobsDir
 
 class FakeProc {
     [bool]$HasExited = $false
@@ -224,7 +226,7 @@ $script:NativeAsked = [datetime]::MinValue
 $script:spawned = @()
 $null = Invoke-Get '/api/state'
 Test-That 'a fresh install has nothing on file, so it asks' $script:spawned.Count 1
-Test-That 'through the CLI, hidden' ($script:spawned[0] -match 'refresh-native webkit versions') $true
+Test-That 'through the CLI, in no window' ($script:spawned[0] -match 'refresh-native webkit versions') $true
 $null = Invoke-Get '/api/state'
 $null = Invoke-Get '/api/state'
 Test-That 'and not again on every poll' $script:spawned.Count 1

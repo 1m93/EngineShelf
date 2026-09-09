@@ -18,9 +18,17 @@
 #   python      zlib+base64 the body, run it through exec() with __file__ set, so
 #               modules that locate siblings via __file__ keep working. Version
 #               independent, unlike a .pyc.
-#   powershell  light by default (strip comments + blanks); --ps-heavy switches
-#               to a gzip+base64 scriptblock wrapper. The heavy path is written
-#               but UNTESTED on a machine without PowerShell.
+#   powershell  nothing, by default. Both paths here are opt-in: --ps-strip for
+#               the comment strip, --ps-heavy for a gzip+base64 scriptblock
+#               wrapper (written but UNTESTED on a machine without PowerShell).
+#               Windows Defender reads a .ps1 through AMSI before PowerShell
+#               compiles it, and what it reads is the shipped text, not ours -
+#               so the build is the last place that gets to decide how that text
+#               looks. A stripped file is denser, has no prose left to say what
+#               it is doing, and is the only copy of EngineShelf that has ever
+#               been refused as malicious. Six shipped .ps1 files are worth less
+#               to an attacker than they are to the machine that has to be
+#               persuaded to run them.
 #   web         html/css/js get comments and indentation stripped. Newlines are
 #               kept so JavaScript automatic-semicolon-insertion cannot break.
 #
@@ -88,6 +96,7 @@ PY
 
 # ---- powershell (light) --------------------------------------------------- #
 
+# Opt-in (--ps-strip), not the default - see the note at the top of this file.
 obf_ps1_light() {
   local file="$1"
   # Drop full-line comments and blank lines, and trim leading indentation.
